@@ -189,7 +189,14 @@ void COutdoorLightScatteringSample::HandleCallbackEvent( CPUTEventID Event, CPUT
         pGUI->GetControl(ID_RLGH_COLOR_BTN)->SetEnable(!CPUTGetFullscreenState() && m_PPAttribs.m_bUseCustomSctrCoeffs);
         pGUI->GetControl(ID_MIE_COLOR_BTN)->SetEnable(!CPUTGetFullscreenState() && m_PPAttribs.m_bUseCustomSctrCoeffs);
         break;
-
+    
+    case ID_ENABLE_VSYNC:
+        {
+            CPUTCheckbox *pCheckBox = static_cast<CPUTCheckbox*>(pControl);
+            mSyncInterval = pCheckBox->GetCheckboxState() == CPUT_CHECKBOX_CHECKED ? 1 : 0;
+            break;
+        }
+    
     case ID_ENABLE_LIGHT_SCATTERING:
         {
             CPUTCheckbox *pCheckBox = static_cast<CPUTCheckbox*>(pControl);
@@ -664,6 +671,12 @@ void COutdoorLightScatteringSample::Create()
 
     CPUTButton* pButton = NULL;
     pGUI->CreateButton(_L("Fullscreen"), ID_FULLSCREEN_BUTTON, ID_MAIN_PANEL, &pButton);
+    
+    {
+        CPUTCheckbox *pCheckBox = NULL;
+        pGUI->CreateCheckbox( L"VSync", ID_ENABLE_VSYNC, ID_MAIN_PANEL, &pCheckBox);
+        pCheckBox->SetCheckboxState( mSyncInterval ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
+    }
 
     {
         CPUTCheckbox *pCheckBox = NULL;
