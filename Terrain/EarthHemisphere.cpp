@@ -659,6 +659,22 @@ HRESULT CEarthHemsiphere::CreateRenderStates(ID3D11Device* pd3dDevice)
     };
     V( pd3dDevice->CreateSamplerState( &SamPointClamp, &m_psamPointClamp) );
     
+    D3D11_SAMPLER_DESC SamLinearClamp = 
+    {
+        D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D11_TEXTURE_ADDRESS_CLAMP,
+        D3D11_TEXTURE_ADDRESS_CLAMP,
+        D3D11_TEXTURE_ADDRESS_CLAMP,
+        0, //FLOAT MipLODBias;
+        0, //UINT MaxAnisotropy;
+        D3D11_COMPARISON_NEVER, // D3D11_COMPARISON_FUNC ComparisonFunc;
+        {0.f, 0.f, 0.f, 0.f}, //FLOAT BorderColor[ 4 ];
+        -FLT_MAX, //FLOAT MinLOD;
+        +FLT_MAX //FLOAT MaxLOD;
+    };
+    V( pd3dDevice->CreateSamplerState( &SamLinearClamp, &m_psamLinearClamp) );
+
+
     D3D11_SAMPLER_DESC SamComparison = 
     {
         D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
@@ -944,6 +960,7 @@ void CEarthHemsiphere::OnD3D11DestroyDevice()
     m_psamPointClamp.Release();
     m_psamLinearMirror.Release();
     m_psamLinearWrap.Release();
+    m_psamLinearClamp.Release();
     m_psamComaprison.Release();
 	m_pEnableDepthTestDS.Release();
     m_pDisableDepthTestDS.Release();
@@ -968,9 +985,17 @@ void CEarthHemsiphere::Render(ID3D11DeviceContext* pd3dImmediateContext,
                               const D3DXVECTOR3 &vCameraPosition, 
                               const D3DXMATRIX &CameraViewProjMatrix,
                               ID3D11Buffer *pcbLightAttribs,
+                              ID3D11Buffer *pcMediaScatteringParams,
                               ID3D11ShaderResourceView *pShadowMapSRV,
+                              ID3D11ShaderResourceView *pPrecomputedNetDensitySRV,
+                              ID3D11ShaderResourceView *pAmbientSkylightSRV,
                               bool bZOnlyPass)
 {
+    if( GetAsyncKeyState(VK_F9) )
+    {
+        m_RenderEarthHemisphereTech.Release();
+    }
+
     if( !m_RenderEarthHemisphereTech.IsValid() )
     {
         HRESULT hr;
@@ -1020,7 +1045,8 @@ void CEarthHemsiphere::Render(ID3D11DeviceContext* pd3dImmediateContext,
     {
         m_pcbTerrainAttribs,
         m_pcbCameraAttribs,
-        pcbLightAttribs
+        pcbLightAttribs,
+        pcMediaScatteringParams
     };
     pd3dImmediateContext->VSSetConstantBuffers(0, _countof(pCBs), pCBs);
     pd3dImmediateContext->PSSetConstantBuffers(0, _countof(pCBs), pCBs);
@@ -1037,8 +1063,11 @@ void CEarthHemsiphere::Render(ID3D11DeviceContext* pd3dImmediateContext,
         pSRVs[3+NUM_TILE_TEXTURES+iTileTex] = m_ptex2DTilNormalMapsSRV[iTileTex];
     }
     pd3dImmediateContext->PSSetShaderResources(1, _countof(pSRVs), pSRVs);
+    pSRVs[0] = pPrecomputedNetDensitySRV;
+    pSRVs[1] = pAmbientSkylightSRV;
+    pd3dImmediateContext->VSSetShaderResources(0, 2, pSRVs);
 
-    ID3D11SamplerState *pSamplers[] = {m_psamLinearMirror, m_psamLinearWrap, m_psamComaprison};
+    ID3D11SamplerState *pSamplers[] = {m_psamLinearMirror, m_psamLinearWrap, m_psamComaprison, m_psamLinearClamp};
 	pd3dImmediateContext->VSSetSamplers(0, _countof(pSamplers), pSamplers);
 	pd3dImmediateContext->PSSetSamplers(0, _countof(pSamplers), pSamplers);
 

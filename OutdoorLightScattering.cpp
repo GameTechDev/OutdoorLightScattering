@@ -215,7 +215,7 @@ void COutdoorLightScatteringSample::HandleCallbackEvent( CPUTEventID Event, CPUT
         {
             CPUTCheckbox *pCheckBox = static_cast<CPUTCheckbox*>(pControl);
             m_PPAttribs.m_bEnableLightShafts = pCheckBox->GetCheckboxState() == CPUT_CHECKBOX_CHECKED;
-            pGUI->GetControl(ID_NUM_INTEGRATION_STEPS)->SetEnable(!m_PPAttribs.m_bEnableLightShafts);
+            pGUI->GetControl(ID_NUM_INTEGRATION_STEPS)->SetEnable(!m_PPAttribs.m_bEnableLightShafts && m_PPAttribs.m_uiSingleScatteringMode == SINGLE_SCTR_MODE_INTEGRATION);
             break;
         }
 
@@ -363,10 +363,57 @@ void COutdoorLightScatteringSample::HandleCallbackEvent( CPUTEventID Event, CPUT
             break;
         }
 
-    case ID_EXPOSURE:
+    case ID_MIDDLE_GRAY:
         {
             CPUTSlider* pSlider = static_cast<CPUTSlider*>(pControl);
-            pSlider->GetValue(m_PPAttribs.m_fExposure);
+            pSlider->GetValue(m_PPAttribs.m_fMiddleGray);
+            break;
+        }
+
+    case ID_WHITE_POINT:
+        {
+            CPUTSlider* pSlider = static_cast<CPUTSlider*>(pControl);
+            pSlider->GetValue(m_PPAttribs.m_fWhitePoint);
+            break;
+        }
+
+    case ID_LUM_SATURATION:
+        {
+            CPUTSlider* pSlider = static_cast<CPUTSlider*>(pControl);
+            pSlider->GetValue(m_PPAttribs.m_fLuminanceSaturation);
+            break;
+        }
+
+    case ID_AUTO_EXPOSURE:
+        {
+            CPUTCheckbox *pCheckBox = static_cast<CPUTCheckbox*>(pControl);
+            m_PPAttribs.m_bAutoExposure = pCheckBox->GetCheckboxState() == CPUT_CHECKBOX_CHECKED;
+            pGUI->GetControl(ID_LIGHT_ADAPTATION)->SetEnable(m_PPAttribs.m_bAutoExposure ? true : false);
+            break;
+        }
+    
+    case ID_TONE_MAPPING_MODE:
+        {
+            CPUTDropdown *pDropDown = static_cast<CPUTDropdown*>(pControl);
+            pDropDown->GetSelectedItem(m_PPAttribs.m_uiToneMappingMode);
+            pGUI->GetControl(ID_LUM_SATURATION)->SetEnable( 
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_EXP ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD_MOD ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_LOGARITHMIC ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_ADAPTIVE_LOG );
+            pGUI->GetControl(ID_WHITE_POINT)->SetEnable(  
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD_MOD ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_UNCHARTED2 ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_LOGARITHMIC ||
+                                m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_ADAPTIVE_LOG );
+            break;
+        }
+
+    case ID_LIGHT_ADAPTATION:
+        {
+            CPUTCheckbox *pCheckBox = static_cast<CPUTCheckbox*>(pControl);
+            m_PPAttribs.m_bLightAdaptation = pCheckBox->GetCheckboxState() == CPUT_CHECKBOX_CHECKED;
             break;
         }
 
@@ -433,6 +480,21 @@ void COutdoorLightScatteringSample::HandleCallbackEvent( CPUTEventID Event, CPUT
         {
             CPUTSlider* pSlider = static_cast<CPUTSlider*>(pControl);
             pSlider->GetValue(m_PPAttribs.m_fAerosolAbsorbtionScale);
+            break;
+        }
+
+    case ID_SINGLE_SCTR_MODE_DROPDOWN:
+        {
+            CPUTDropdown *pDropDown = static_cast<CPUTDropdown*>(pControl);
+            pDropDown->GetSelectedItem(m_PPAttribs.m_uiSingleScatteringMode);
+            pGUI->GetControl(ID_NUM_INTEGRATION_STEPS)->SetEnable(!m_PPAttribs.m_bEnableLightShafts && m_PPAttribs.m_uiSingleScatteringMode == SINGLE_SCTR_MODE_INTEGRATION);
+            break;
+        }
+
+    case ID_MULTIPLE_SCTR_MODE_DROPDOWN:
+        {
+            CPUTDropdown *pDropDown = static_cast<CPUTDropdown*>(pControl);
+            pDropDown->GetSelectedItem(m_PPAttribs.m_uiMultipleScatteringMode);
             break;
         }
 
@@ -664,6 +726,7 @@ void COutdoorLightScatteringSample::Create()
     {
         pGUI->CreateDropdown( L"Controls: basic", ID_SELECT_PANEL_COMBO, CONTROL_PANEL_IDS[iPanel], &m_pSelectPanelDropDowns[iPanel]);
         m_pSelectPanelDropDowns[iPanel]->AddSelectionItem( L"Controls: additional" );
+        m_pSelectPanelDropDowns[iPanel]->AddSelectionItem( L"Controls: tone mapping" );
         // SelectedItem is 1-based
         m_pSelectPanelDropDowns[iPanel]->SetSelectedItem(m_uiSelectedPanelInd+1);
     }
@@ -715,7 +778,7 @@ void COutdoorLightScatteringSample::Create()
         std::wstringstream NumStepsSS;
         NumStepsSS << "Num integration steps: " << m_PPAttribs.m_uiInstrIntegralSteps;
         pGUI->CreateSlider( NumStepsSS.str().c_str(), ID_NUM_INTEGRATION_STEPS, ID_MAIN_PANEL, &pSlider);
-        pSlider->SetEnable(!m_PPAttribs.m_bEnableLightShafts);
+        pSlider->SetEnable(!m_PPAttribs.m_bEnableLightShafts && m_PPAttribs.m_uiSingleScatteringMode == SINGLE_SCTR_MODE_INTEGRATION);
 
         unsigned long ulStartVal, ulEndVal;
         BitScanForward(&ulStartVal, m_iMinEpipolarSlices);
@@ -797,13 +860,6 @@ void COutdoorLightScatteringSample::Create()
     }
 
     {
-        CPUTSlider* pSlider = NULL;
-        pGUI->CreateSlider( L"Exposure", ID_EXPOSURE, ID_MAIN_PANEL, &pSlider);
-        pSlider->SetScale( 0.2f, 5.f, 50 );
-        pSlider->SetValue( m_PPAttribs.m_fExposure );
-    }
-
-    {
         CPUTCheckbox *pCheckBox = NULL;
         pGUI->CreateCheckbox( L"Show sampling", ID_SHOW_SAMPLING, ID_MAIN_PANEL, &pCheckBox);
         pCheckBox->SetCheckboxState( m_PPAttribs.m_bShowSampling ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
@@ -839,6 +895,22 @@ void COutdoorLightScatteringSample::Create()
         pCheckBox->SetCheckboxState( m_PPAttribs.m_bShowLightingOnly ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
     }
 
+    {
+        CPUTDropdown *pDropDown = NULL;
+        pGUI->CreateDropdown( L"Sngl sctr: none", ID_SINGLE_SCTR_MODE_DROPDOWN, ID_ADDITIONAL_ATTRIBS_PANEL, &pDropDown);
+        pDropDown->AddSelectionItem( L"Sngl sctr: integration" );
+        pDropDown->AddSelectionItem( L"Sngl sctr: LUT" );
+        pDropDown->SetSelectedItem( m_PPAttribs.m_uiSingleScatteringMode+1 );
+    }
+    
+    {
+        CPUTDropdown *pDropDown = NULL;
+        pGUI->CreateDropdown( L"Mult sctr: none", ID_MULTIPLE_SCTR_MODE_DROPDOWN, ID_ADDITIONAL_ATTRIBS_PANEL, &pDropDown);
+        pDropDown->AddSelectionItem( L"Mult sctr: unoccluded" );
+        pDropDown->AddSelectionItem( L"Mult sctr: occluded" );
+        pDropDown->SetSelectedItem( m_PPAttribs.m_uiMultipleScatteringMode+1 );
+    }
+    
     {
         CPUTDropdown *pDropDown = NULL;
         pGUI->CreateDropdown( L"Num Cascades: 1", ID_NUM_CASCADES_DROPDOWN, ID_ADDITIONAL_ATTRIBS_PANEL, &pDropDown);
@@ -900,7 +972,7 @@ void COutdoorLightScatteringSample::Create()
 
     {
         CPUTDropdown *pDropDown = NULL;
-        pGUI->CreateDropdown( L"Extinction eval mode: density LUT", ID_EXTINCTION_EVAL_MODE_DROPDOWN, ID_ADDITIONAL_ATTRIBS_PANEL, &pDropDown);
+        pGUI->CreateDropdown( L"Extinction eval mode: per pixel", ID_EXTINCTION_EVAL_MODE_DROPDOWN, ID_ADDITIONAL_ATTRIBS_PANEL, &pDropDown);
         pDropDown->AddSelectionItem( L"Extinction eval mode: Epipolar" );
         pDropDown->SetSelectedItem( m_PPAttribs.m_uiExtinctionEvalMode+1 );
     }
@@ -958,6 +1030,60 @@ void COutdoorLightScatteringSample::Create()
         pCheckBox->SetCheckboxState( m_bAnimateSun ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
     }
 
+    {
+        CPUTSlider* pSlider = NULL;
+        pGUI->CreateSlider( L"Middle gray (Key)", ID_MIDDLE_GRAY, ID_TONE_MAPPING_ATTRIBS_PANEL, &pSlider);
+        pSlider->SetScale( 0.01f, 1.f, 50 );
+        pSlider->SetValue( m_PPAttribs.m_fMiddleGray );
+    }
+
+    {
+        CPUTSlider* pSlider = NULL;
+        pGUI->CreateSlider( L"White point", ID_WHITE_POINT, ID_TONE_MAPPING_ATTRIBS_PANEL, &pSlider);
+        pSlider->SetScale( 0.01f, 10.f, 50 );
+        pSlider->SetValue( m_PPAttribs.m_fWhitePoint );
+        pSlider->SetEnable( m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD_MOD ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_UNCHARTED2 ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_LOGARITHMIC ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_ADAPTIVE_LOG );
+    }
+
+    {
+        CPUTSlider* pSlider = NULL;
+        pGUI->CreateSlider( L"Luminance saturation", ID_LUM_SATURATION, ID_TONE_MAPPING_ATTRIBS_PANEL, &pSlider);
+        pSlider->SetScale( 0.01f, 2.f, 50 );
+        pSlider->SetValue( m_PPAttribs.m_fLuminanceSaturation );
+        pSlider->SetEnable( m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_EXP ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_MODE_REINHARD_MOD ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_LOGARITHMIC ||
+                            m_PPAttribs.m_uiToneMappingMode == TONE_MAPPING_ADAPTIVE_LOG );
+    }
+
+    {
+        CPUTCheckbox *pCheckBox = NULL;
+        pGUI->CreateCheckbox( L"Auto exposure", ID_AUTO_EXPOSURE, ID_TONE_MAPPING_ATTRIBS_PANEL, &pCheckBox);
+        pCheckBox->SetCheckboxState( m_PPAttribs.m_bAutoExposure ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
+    }
+
+    {
+        CPUTDropdown *pDropDown = NULL;
+        pGUI->CreateDropdown( L"Tone mapping: exp", ID_TONE_MAPPING_MODE, ID_TONE_MAPPING_ATTRIBS_PANEL, &pDropDown);
+        pDropDown->AddSelectionItem( L"Tone mapping: Reinhard" );
+        pDropDown->AddSelectionItem( L"Tone mapping: Reinhard Mod" );
+        pDropDown->AddSelectionItem( L"Tone mapping: Uncharted 2" );
+        pDropDown->AddSelectionItem( L"Tone mapping: Filmic ALU" );
+        pDropDown->AddSelectionItem( L"Tone mapping: Logarithmic" );
+        pDropDown->AddSelectionItem( L"Tone mapping: Adaptive log" );
+        pDropDown->SetSelectedItem( m_PPAttribs.m_uiToneMappingMode + 1 );
+    }
+
+    {
+        CPUTCheckbox *pCheckBox = NULL;
+        pGUI->CreateCheckbox( L"Light adaptation", ID_LIGHT_ADAPTATION, ID_TONE_MAPPING_ATTRIBS_PANEL, &pCheckBox);
+        pCheckBox->SetCheckboxState( m_PPAttribs.m_bLightAdaptation ? CPUT_CHECKBOX_CHECKED : CPUT_CHECKBOX_UNCHECKED );
+        pCheckBox->SetEnable(m_PPAttribs.m_bAutoExposure ? true : false );
+    }
 
     pGUI->CreateText( _L("F1 for Help"), ID_IGNORE_CONTROL_ID, ID_HELP_TEXT_PANEL);
     pGUI->CreateText( _L("[Escape] to quit application"), ID_IGNORE_CONTROL_ID, ID_HELP_TEXT_PANEL);
@@ -1311,7 +1437,7 @@ void COutdoorLightScatteringSample::RenderShadowMap(ID3D11DeviceContext *pContex
         pContext->ClearDepthStencilView(m_pShadowMapDSVs[iCascade], D3D11_CLEAR_DEPTH, 0.f, 0);
 
         // Render terrain to shadow map
-        m_EarthHemisphere.Render(mpContext, m_CameraPos, WorldToLightProjSpaceMatr, nullptr, nullptr, true);
+        m_EarthHemisphere.Render(mpContext, m_CameraPos, WorldToLightProjSpaceMatr, nullptr, nullptr, nullptr, nullptr, nullptr, true);
 
     }
 
@@ -1497,8 +1623,7 @@ void COutdoorLightScatteringSample::Render(double deltaSeconds)
 
     D3DXVECTOR4 f4ExtraterrestrialSunColor = D3DXVECTOR4(10,10,10,10);
     LightAttribs.f4ExtraterrestrialSunColor = f4ExtraterrestrialSunColor*m_fScatteringScale;
-    m_pLightSctrPP->ComputeSunColor( v3DirOnLight, f4ExtraterrestrialSunColor, LightAttribs.f4LightColorAndIntensity, LightAttribs.f4AmbientLight );
-    mLightColor = (float3&)LightAttribs.f4LightColorAndIntensity;
+    mLightColor = (float3&)f4ExtraterrestrialSunColor;
 
     CPUTGuiControllerDX11* pGUI = CPUTGetGuiController();
     UINT uiSelectedItem;
@@ -1543,8 +1668,10 @@ void COutdoorLightScatteringSample::Render(double deltaSeconds)
 
     
     // Render terrain
-    
-    m_EarthHemisphere.Render( mpContext, m_CameraPos, mViewProj, m_pcbLightAttribs, m_pShadowMapSRV, false);
+    ID3D11Buffer *pcMediaScatteringParams = m_pLightSctrPP->GetMediaAttribsCB();
+    ID3D11ShaderResourceView *pPrecomputedNetDensitySRV = m_pLightSctrPP->GetPrecomputedNetDensitySRV();
+    ID3D11ShaderResourceView *pAmbientSkyLightSRV = m_pLightSctrPP->GetAmbientSkyLightSRV(mpD3dDevice, mpContext);
+    m_EarthHemisphere.Render( mpContext, m_CameraPos, mViewProj, m_pcbLightAttribs, pcMediaScatteringParams, m_pShadowMapSRV, pPrecomputedNetDensitySRV, pAmbientSkyLightSRV, false);
 
     if( m_bEnableLightScattering )
     {
@@ -1555,6 +1682,7 @@ void COutdoorLightScatteringSample::Render(double deltaSeconds)
 
         FrameAttribs.pd3dDevice = mpD3dDevice;
         FrameAttribs.pd3dDeviceContext = mpContext;
+        FrameAttribs.dElapsedTime = deltaSeconds;
         FrameAttribs.pLightAttribs = &LightAttribs;
 
         m_PPAttribs.m_iNumCascades = m_TerrainRenderParams.m_iNumShadowCascades;

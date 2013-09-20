@@ -232,10 +232,7 @@ CPUTResult CPUT_DX11::CreateDXContext(CPUTWindowCreationParams params)
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
     // set the vsync parameter
-    if(0 != params.deviceParams.refreshRate)
-    {
-        mSyncInterval = 1;
-    }
+    mSyncInterval = (0 != params.deviceParams.refreshRate)? 1 : 0;
 
     // walk devices and create device and swap chain on best matching piece of hardware
     bool functionalityTestPassed = false;
@@ -877,11 +874,15 @@ CPUTResult CPUT_DX11::CPUTParseCommandLine(cString commandLine, CPUTWindowCreati
                     // get the bool 
                     token = wcstok_s(NULL, separators, &nextToken); 
                     cString boolString(token);
-                    if(0==boolString.compare(_L("true")))
+                    if( (0==boolString.compare(_L("on"))) || (0==boolString.compare(_L("true"))) )
                     {
                         // vsync set to 30 FPS
                         pWindowParams->deviceParams.refreshRate = 30;
                     }
+					if( (0==boolString.compare(_L("off"))) || (0==boolString.compare(_L("false"))) )
+					{
+						pWindowParams->deviceParams.refreshRate = 0;
+					}
                 }
                 else if(0==ParameterName.compare(_L("xpos")))
                 {

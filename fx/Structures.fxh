@@ -83,7 +83,6 @@ static_assert( (sizeof(SShadowMapAttribs) % 16) == 0, "sizeof(SShadowMapAttribs)
 struct SLightAttribs
 {
     float4 f4DirOnLight;
-    float4 f4LightColorAndIntensity;
     float4 f4AmbientLight;
     float4 f4LightScreenPos;
     float4 f4ExtraterrestrialSunColor;
@@ -127,11 +126,28 @@ CHECK_STRUCT_ALIGNMENT(SCameraAttribs);
 #define REFINEMENT_CRITERION_INSCTR_DIFF 1
 
 // Extinction evaluation mode used when attenuating background
-#define EXTINCTION_EVAL_MODE_LUT 0      // Use particle net density integral look-up table
-                                        // to evaluate extinction on the fly
+#define EXTINCTION_EVAL_MODE_PER_PIXEL 0// Evaluate extinction for each pixel using analytic formula 
+                                        // by Eric Bruneton
 #define EXTINCTION_EVAL_MODE_EPIPOLAR 1 // Render extinction in epipolar space and perform
                                         // bilateral filtering in the same manner as for
                                         // inscattering
+
+#define SINGLE_SCTR_MODE_NONE 0
+#define SINGLE_SCTR_MODE_INTEGRATION 1
+#define SINGLE_SCTR_MODE_LUT 2
+
+#define MULTIPLE_SCTR_MODE_NONE 0
+#define MULTIPLE_SCTR_MODE_UNOCCLUDED 1
+#define MULTIPLE_SCTR_MODE_OCCLUDED 2
+
+#define TONE_MAPPING_MODE_EXP 0
+#define TONE_MAPPING_MODE_REINHARD 1
+#define TONE_MAPPING_MODE_REINHARD_MOD 2
+#define TONE_MAPPING_MODE_UNCHARTED2 3
+#define TONE_MAPPING_FILMIC_ALU 4
+#define TONE_MAPPING_LOGARITHMIC 5
+#define TONE_MAPPING_ADAPTIVE_LOG 6
+
 
 struct SPostProcessingAttribs
 {
@@ -158,7 +174,7 @@ struct SPostProcessingAttribs
 
     BOOL m_bUse1DMinMaxTree;
     uint m_uiMaxShadowMapStep;
-    float m_fExposure;
+    float m_fMiddleGray;
     uint m_uiLightSctrTechnique;
 
     int m_iNumCascades;
@@ -169,8 +185,17 @@ struct SPostProcessingAttribs
     uint m_uiCascadeProcessingMode;
     uint m_uiRefinementCriterion;
     BOOL m_bIs32BitMinMaxMipMap;
-    float fDummy;
+    uint m_uiMultipleScatteringMode;
 
+    uint m_uiSingleScatteringMode;
+    BOOL m_bAutoExposure;
+    uint m_uiToneMappingMode;
+    BOOL m_bLightAdaptation;
+    
+    float m_fWhitePoint;
+    float m_fLuminanceSaturation;
+    float2 f2Dummy;
+    
     uint m_uiExtinctionEvalMode;
     BOOL m_bUseCustomSctrCoeffs;
     float m_fAerosolDensityScale;
@@ -199,7 +224,7 @@ struct SPostProcessingAttribs
         m_uiMaxShadowMapStep(16),
         m_f2ShadowMapTexelSize(0,0),
         m_uiMinMaxShadowMapResolution(0),
-        m_fExposure(2.5f),
+        m_fMiddleGray(0.18f),
         m_uiLightSctrTechnique(LIGHT_SCTR_TECHNIQUE_EPIPOLAR_SAMPLING),
         m_iNumCascades(0),
         m_iFirstCascade(1),
@@ -208,6 +233,13 @@ struct SPostProcessingAttribs
         m_uiCascadeProcessingMode(CASCADE_PROCESSING_MODE_SINGLE_PASS),
         m_uiRefinementCriterion(REFINEMENT_CRITERION_INSCTR_DIFF),
         m_bIs32BitMinMaxMipMap(FALSE),
+        m_uiMultipleScatteringMode(MULTIPLE_SCTR_MODE_OCCLUDED),
+        m_uiSingleScatteringMode(SINGLE_SCTR_MODE_LUT),
+        m_bAutoExposure(TRUE),
+        m_uiToneMappingMode(TONE_MAPPING_MODE_UNCHARTED2),
+        m_bLightAdaptation(TRUE),
+        m_fWhitePoint(3.f),
+        m_fLuminanceSaturation(1.f),
         m_uiExtinctionEvalMode(EXTINCTION_EVAL_MODE_EPIPOLAR),
         m_bUseCustomSctrCoeffs(FALSE),
         m_fAerosolDensityScale(1.f),
@@ -274,6 +306,10 @@ struct SMiscDynamicParams
 {
     float fMaxStepsAlongRay;   // Maximum number of steps during ray tracing
     float fCascadeInd;
+    float2 f2WQ; // Used when pre-computing inscattering look-up table
+
+    uint uiDepthSlice;
+    float fElapsedTime;
     float2 f2Dummy;
 
 #ifdef __cplusplus

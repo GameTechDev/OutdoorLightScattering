@@ -13,6 +13,7 @@
 // responsibility to update it.
 
 #include "TerrainStructs.fxh"
+#include "..\fx\Structures.fxh"
 
 // Texturing modes
 #define TM_HEIGHT_BASED 0             // Simple height-based texturing mode using 1D look-up table
@@ -31,6 +32,8 @@
 #   define NUM_SHADOW_CASCADES 4
 #endif
 
+static const float g_fEarthReflectance = 0.4f;
+
 cbuffer cbTerrainAttribs : register( b0 )
 {
     STerrainAttribs g_TerrainAttribs;
@@ -45,6 +48,12 @@ cbuffer cbLightAttribs : register( b2 )
 {
     SLightAttribs g_LightAttribs;
 }
+
+cbuffer cbParticipatingMediaScatteringParams : register( b3 )
+{
+    SAirScatteringAttribs g_MediaParams;
+}
+
 
 cbuffer cbNMGenerationAttribs : register( b0 )
 {
@@ -79,6 +88,13 @@ SamplerComparisonState samComparison : register (s2)
     AddressV = Clamp;
 };
 
+SamplerState samLinearClamp : register( s3 )
+{
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
 
 Texture2D<float> g_tex2DElevationMap  : register( t0 );
 // Normal map stores only x,y components. z component is calculated as sqrt(1 - x^2 - y^2)
@@ -88,7 +104,8 @@ Texture2DArray<float>  g_tex2DShadowMap : register (t3);
 Texture2D<float4> g_tex2DTileTextures[NUM_TILE_TEXTURES]   : register( t4 );   // Material texture
 Texture2D<float3> g_tex2DTileNormalMaps[NUM_TILE_TEXTURES] : register( t9 );   // Material texture
 //Texture2D<float3> g_tex2DElevationColor: register( t4 );
-
+Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t0 ); // Used in VS
+Texture2D<float3> g_tex2DAmbientSkylight            : register( t1 ); // Used in VS
 
 #ifndef BEST_CASCADE_SEARCH
 #   define BEST_CASCADE_SEARCH 1
@@ -317,7 +334,33 @@ struct SHemisphereVSOutput
     float2 f2MaskUV0 : MASK_UV0;
     float3 f3Tangent : TANGENT;
     float3 f3Bitangent : BITANGENT;
+    float3 f3SunLightExtinction : EXTINCTION;
+    float3 f3AmbientSkyLight : AMBIENT_SKY_LIGHT;
 };
+
+void GetSunLightExtinctionAndSkyLight(in float3 f3PosWS,
+                                      out float3 f3Extinction,
+                                      out float3 f3AmbientSkyLight)
+{
+    float3 f3EarthCentre = float3(0, -g_MediaParams.fEarthRadius, 0);
+    float3 f3DirFromEarthCentre = f3PosWS - f3EarthCentre;
+    float fDistToCentre = length(f3DirFromEarthCentre);
+    f3DirFromEarthCentre /= fDistToCentre;
+    float fHeightAboveSurface = fDistToCentre - g_MediaParams.fEarthRadius;
+    float fCosZenithAngle = dot(f3DirFromEarthCentre, g_LightAttribs.f4DirOnLight.xyz);
+
+    float fRelativeHeightAboveSurface = fHeightAboveSurface / g_MediaParams.fAtmTopHeight;
+    float2 f2ParticleDensityToAtmTop = g_tex2DOccludedNetDensityToAtmTop.SampleLevel(samLinearClamp, float2(fRelativeHeightAboveSurface, fCosZenithAngle*0.5+0.5), 0).xy;
+    
+    float3 f3RlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2ParticleDensityToAtmTop.x;
+    float3 f3MieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb      * f2ParticleDensityToAtmTop.y;
+        
+    // And total extinction for the current integration point:
+    f3Extinction = exp( -(f3RlghOpticalDepth + f3MieOpticalDepth) );
+    
+    f3AmbientSkyLight = g_tex2DAmbientSkylight.SampleLevel(samLinearClamp, float2(fCosZenithAngle*0.5+0.5, 0.5), 0);
+}
+
 
 SHemisphereVSOutput HemisphereVS(in float3 f3PosWS : WORLD_POS,
                                  in float2 f2MaskUV0 : MASK0_UV)
@@ -335,6 +378,8 @@ SHemisphereVSOutput HemisphereVS(in float3 f3PosWS : WORLD_POS,
     Out.f3Normal = f3Normal;
     Out.f3Tangent = normalize( cross(f3Normal, float3(0,0,1)) );
     Out.f3Bitangent = normalize( cross(Out.f3Tangent, f3Normal) );
+
+    GetSunLightExtinctionAndSkyLight(f3PosWS, Out.f3SunLightExtinction, Out.f3AmbientSkyLight);
 
     return Out;
 }
@@ -369,20 +414,29 @@ float3 HemispherePS(SHemisphereVSOutput In) : SV_Target
     float3 f3TerrainBitangent = normalize( cross(f3TerrainTangent, f3TerrainNormal) );
     float3 f3Normal = normalize( mul(SurfaceNormalTS.xzy, float3x3(f3TerrainTangent, f3TerrainNormal, f3TerrainBitangent)) );
 
+    // Attenuate extraterrestrial sun color with the extinction factor
+    float3 f3SunLight = g_LightAttribs.f4ExtraterrestrialSunColor.rgb * In.f3SunLightExtinction;
+    // Ambient sky light is not pre-multiplied with the sun intensity
+    float3 f3AmbientSkyLight = g_LightAttribs.f4ExtraterrestrialSunColor.rgb * In.f3AmbientSkyLight;
+    // Account for occlusion by the ground plane
+    f3AmbientSkyLight *= saturate((1 + dot(EarthNormal, f3Normal))/2.f);
+
+    // We need to divide diffuse color by PI to get the reflectance value
+    float3 SurfaceReflectance = SurfaceColor * g_fEarthReflectance / PI;
+
     float Cascade;
     float fLightAmount = ComputeShadowAmount(In.f3PosInLightViewSpace.xyz, In.fCameraSpaceZ, Cascade);
-
     float DiffuseIllumination = max(0, dot(f3Normal, g_LightAttribs.f4DirOnLight.xyz));
-    float3 lightColor = g_LightAttribs.f4LightColorAndIntensity.rgb;
+    
     float3 f3CascadeColor = 0;
     if( g_LightAttribs.ShadowAttribs.bVisualizeCascades )
     {
-        f3CascadeColor = (Cascade < NUM_SHADOW_CASCADES ? g_TerrainAttribs.f4CascadeColors[Cascade].rgb : float3(1,1,1)) / 4 ;
+        f3CascadeColor = (Cascade < NUM_SHADOW_CASCADES ? g_TerrainAttribs.f4CascadeColors[Cascade].rgb : float3(1,1,1)) / 8 ;
     }
+    
+    float3 f3FinalColor = f3CascadeColor +  SurfaceReflectance * (fLightAmount*DiffuseIllumination*f3SunLight + f3AmbientSkyLight);
 
-    SurfaceColor.rgb *= (f3CascadeColor + fLightAmount*DiffuseIllumination*lightColor + g_LightAttribs.f4AmbientLight.rgb);
-
-    return SurfaceColor;
+    return f3FinalColor;
 }
 
 technique11 RenderHemisphereTech

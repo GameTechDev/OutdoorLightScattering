@@ -20,6 +20,10 @@
 #   define OPTIMIZE_SAMPLE_LOCATIONS 1
 #endif
 
+#ifndef CORRECT_INSCATTERING_AT_DEPTH_BREAKS
+#   define CORRECT_INSCATTERING_AT_DEPTH_BREAKS 0
+#endif
+
 //#define SHADOW_MAP_DEPTH_BIAS 1e-4
 
 #ifndef TRAPEZOIDAL_INTEGRATION
@@ -50,6 +54,46 @@
 #   define IS_32BIT_MIN_MAX_MAP 0
 #endif
 
+#ifndef SINGLE_SCATTERING_MODE
+#   define SINGLE_SCATTERING_MODE SINGLE_SCTR_MODE_LUT
+#endif
+
+#ifndef MULTIPLE_SCATTERING_MODE
+#   define MULTIPLE_SCATTERING_MODE MULTIPLE_SCTR_MODE_OCCLUDED
+#endif
+
+#ifndef PRECOMPUTED_SCTR_LUT_DIM
+#   define PRECOMPUTED_SCTR_LUT_DIM float4(32,128,32,16)
+#endif
+
+#ifndef NUM_RANDOM_SPHERE_SAMPLES
+#   define NUM_RANDOM_SPHERE_SAMPLES 128
+#endif
+
+#ifndef PERFORM_TONE_MAPPING
+#   define PERFORM_TONE_MAPPING 1
+#endif
+
+#ifndef LOW_RES_LUMINANCE_MIPS
+#   define LOW_RES_LUMINANCE_MIPS 7
+#endif
+
+#define RGB_TO_LUMINANCE float3(0.212671, 0.715160, 0.072169)
+
+#ifndef AUTO_EXPOSURE
+#   define AUTO_EXPOSURE 1
+#endif
+
+#ifndef TONE_MAPPING_MODE
+#   define TONE_MAPPING_MODE TONE_MAPPING_MODE_REINHARD_MOD
+#endif
+
+#ifndef LIGHT_ADAPTATION
+#   define LIGHT_ADAPTATION 1
+#endif
+
+#define INVALID_EPIPOLAR_LINE float4(-1000,-1000, -100, -100)
+
 //--------------------------------------------------------------------------------------
 // Texture samplers
 //--------------------------------------------------------------------------------------
@@ -70,6 +114,8 @@ SamplerComparisonState samComparison : register( s2 )
     ComparisonFunc = GREATER;
     BorderColor = float4(0.0, 0.0, 0.0, 0.0);
 };
+
+SamplerState samPointClamp : register( s3 );
 
 //--------------------------------------------------------------------------------------
 // Depth stencil states
@@ -154,10 +200,104 @@ float GetCamSpaceZ(in float2 ScreenSpaceUV)
     return g_tex2DCamSpaceZ.SampleLevel(samLinearClamp, ScreenSpaceUV, 0);
 }
 
+ 
+float3 Uncharted2Tonemap(float3 x)
+{
+    // http://www.gdcvault.com/play/1012459/Uncharted_2__HDR_Lighting
+    // http://filmicgames.com/archives/75 - the coefficients are from here
+    float A = 0.15; // Shoulder Strength
+    float B = 0.50; // Linear Strength
+    float C = 0.10; // Linear Angle
+    float D = 0.20; // Toe Strength
+    float E = 0.02; // Toe Numerator
+    float F = 0.30; // Toe Denominator
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F; // E/F = Toe Angle
+}
+
 float3 ToneMap(in float3 f3Color)
 {
-    float fExposure = g_PPAttribs.m_fExposure;
-    return 1.0 - exp(-fExposure * f3Color);
+#if AUTO_EXPOSURE
+    float fAveLogLum = g_tex2DAverageLuminance.Load( int3(0,0,0) );
+#else
+    float fAveLogLum =  0.1;
+#endif
+    fAveLogLum = max(0.05, fAveLogLum); // Average luminance is an approximation to the key of the scene
+
+    //const float middleGray = 1.03 - 2 / (2 + log10(fAveLogLum+1));
+    const float middleGray = g_PPAttribs.m_fMiddleGray;
+    // Compute scale factor such that average luminance maps to middle gray
+    float fLumScale = middleGray / fAveLogLum;
+    
+    f3Color = max(f3Color, 0);
+    float fInitialPixelLum = max(dot(RGB_TO_LUMINANCE, f3Color), 1e-10);
+    float fScaledPixelLum = fInitialPixelLum * fLumScale;
+    float3 f3ScaledColor = f3Color * fLumScale;
+
+    float whitePoint = g_PPAttribs.m_fWhitePoint;
+
+#if TONE_MAPPING_MODE == TONE_MAPPING_MODE_EXP
+    
+    float  fToneMappedLum = 1.0 - exp( -fScaledPixelLum );
+    return fToneMappedLum * pow(f3Color / fInitialPixelLum, g_PPAttribs.m_fLuminanceSaturation);
+
+#elif TONE_MAPPING_MODE == TONE_MAPPING_MODE_REINHARD || TONE_MAPPING_MODE == TONE_MAPPING_MODE_REINHARD_MOD
+
+    // http://www.cs.utah.edu/~reinhard/cdrom/tonemap.pdf
+    // http://imdoingitwrong.wordpress.com/2010/08/19/why-reinhard-desaturates-my-blacks-3/
+    // http://content.gpwiki.org/index.php/D3DBook:High-Dynamic_Range_Rendering
+
+    float  L_xy = fScaledPixelLum;
+#   if TONE_MAPPING_MODE == TONE_MAPPING_MODE_REINHARD
+        float  fToneMappedLum = L_xy / (1 + L_xy);
+#   else
+	    float  fToneMappedLum = L_xy * (1 + L_xy / (whitePoint*whitePoint)) / (1 + L_xy);
+#   endif
+	return fToneMappedLum * pow(f3Color / fInitialPixelLum, g_PPAttribs.m_fLuminanceSaturation);
+
+#elif TONE_MAPPING_MODE == TONE_MAPPING_MODE_UNCHARTED2
+
+    // http://filmicgames.com/archives/75
+    float ExposureBias = 2.0f;
+    float3 curr = Uncharted2Tonemap(ExposureBias*f3ScaledColor);
+    float3 whiteScale = 1.0f/Uncharted2Tonemap(whitePoint);
+    return curr*whiteScale;
+
+#elif TONE_MAPPING_MODE == TONE_MAPPING_FILMIC_ALU
+
+    // http://www.gdcvault.com/play/1012459/Uncharted_2__HDR_Lighting
+    float3 f3ToneMappedColor = max(0, f3ScaledColor - 0.004f);
+    f3ToneMappedColor = (f3ToneMappedColor * (6.2f * f3ToneMappedColor + 0.5f)) / 
+                        (f3ToneMappedColor * (6.2f * f3ToneMappedColor + 1.7f)+ 0.06f);
+    // result has 1/2.2 gamma baked in
+    return pow(f3ToneMappedColor, 2.2f);
+
+#elif TONE_MAPPING_MODE == TONE_MAPPING_LOGARITHMIC
+    
+    // http://www.mpi-inf.mpg.de/resources/tmo/logmap/logmap.pdf
+    float fToneMappedLum = log10(1 + fScaledPixelLum) / log10(1 + whitePoint);
+	return fToneMappedLum * pow(f3Color / fInitialPixelLum, g_PPAttribs.m_fLuminanceSaturation);
+
+#elif TONE_MAPPING_MODE == TONE_MAPPING_ADAPTIVE_LOG
+
+    // http://www.mpi-inf.mpg.de/resources/tmo/logmap/logmap.pdf
+    float Bias = 0.85;
+    float fToneMappedLum = 
+        1 / log10(1 + whitePoint) *
+        log(1 + fScaledPixelLum) / log( 2 + 8 * pow( fScaledPixelLum / whitePoint, log(Bias) / log(0.5f)) );
+	return fToneMappedLum * pow(f3Color / fInitialPixelLum, g_PPAttribs.m_fLuminanceSaturation);
+
+#endif
+}
+
+float4 UpdateAverageLuminancePS() : SV_Target
+{
+#if LIGHT_ADAPTATION
+    const float fAdaptationRate = 1.f;
+    float fNewLuminanceWeight = 1 - exp( - fAdaptationRate * g_MiscParams.fElapsedTime );
+#else
+    float fNewLuminanceWeight = 1;
+#endif
+    return float4( exp( g_tex2DLowResLuminance.Load( int3(0,0,LOW_RES_LUMINANCE_MIPS-1) ) ), 0, 0, fNewLuminanceWeight );
 }
 
 float3 ProjSpaceXYToWorldSpace(in float2 f2PosPS)
@@ -244,6 +384,14 @@ const float4 GetOutermostScreenPixelCoords()
     return float4(-1,-1,1,1) + float4(1, 1, -1, -1) / SCREEN_RESLOUTION.xyxy;
 }
 
+// When checking if a point is inside the screen, we must test against 
+// the biased screen boundaries 
+bool IsValidScreenLocation(in float2 f2XY)
+{
+    const float SAFETY_EPSILON = 0.2f;
+    return all( abs(f2XY) <= 1.f - (1.f - SAFETY_EPSILON) / SCREEN_RESLOUTION.xy );
+}
+
 // This function computes entry point of the epipolar line given its exit point
 //                  
 //    g_LightAttribs.f4LightScreenPos
@@ -262,7 +410,7 @@ float2 GetEpipolarLineEntryPoint(float2 f2ExitPoint)
 {
     float2 f2EntryPoint;
 
-    //if( all( abs(g_LightAttribs.f4LightScreenPos.xy) < 1 ) )
+    //if( IsValidScreenLocation(g_LightAttribs.f4LightScreenPos.xy) )
     if( g_LightAttribs.bIsLightOnScreen )
     {
         // If light source is on the screen, its location is entry point for each epipolar line
@@ -356,6 +504,26 @@ float4 GenerateSliceEndpointsPS(SScreenSizeQuadVSOutput In) : SV_Target
     uint uiBoundary = clamp(floor( fEpipolarSlice * 4 ), 0, 3);
     float fPosOnBoundary = frac( fEpipolarSlice * 4 );
 
+    bool4 b4BoundaryFlags = bool4( uiBoundary.xxxx == uint4(0,1,2,3) );
+
+    // Note that in fact the outermost visible screen pixels do not lie exactly on the boundary (+1 or -1), but are biased by
+    // 0.5 screen pixel size inwards. Using these adjusted boundaries improves precision and results in
+    // samller number of pixels which require inscattering correction
+    float4 f4OutermostScreenPixelCoords = GetOutermostScreenPixelCoords();// xyzw = (left, bottom, right, top)
+
+    // Check if there can definitely be no correct intersection with the boundary:
+    //  
+    //  Light.x <= LeftBnd     Light.x >= RightBnd     Light.y >= TopBnd    Light.y <= BottomBnd
+    //                                                        *                     
+    //          ____                ____                   __/_                    ____
+    //        .|    |              |    |  .*             |    |                  |    |
+    //      .' |____|              |____|.'               |____|                  |____|
+    //     *                                                                         \    
+    //                                                                                *
+    bool4 b4IsInvalidBoundary = bool4( (g_LightAttribs.f4LightScreenPos.xyxy - f4OutermostScreenPixelCoords.xyzw) * float4(1,1,-1,-1) <= 0 );
+    if( dot(b4IsInvalidBoundary, b4BoundaryFlags) )
+        return INVALID_EPIPOLAR_LINE;
+
     //             <------
     //   +1   0,1___________0.75
     //          |     3     |
@@ -371,21 +539,15 @@ float4 GenerateSliceEndpointsPS(SScreenSizeQuadVSOutput In) : SV_Target
     //                                   Left             Bottom           Right              Top   
     float4 f4BoundaryXPos = float4(               0, fPosOnBoundary,                1, 1-fPosOnBoundary);
     float4 f4BoundaryYPos = float4( 1-fPosOnBoundary,              0,  fPosOnBoundary,                1);
-    bool4 b4BoundaryFlags = bool4( uiBoundary.xxxx == uint4(0,1,2,3) );
     // Select the right coordinates for the boundary
     float2 f2ExitPointPosOnBnd = float2( dot(f4BoundaryXPos, b4BoundaryFlags), dot(f4BoundaryYPos, b4BoundaryFlags) );
-    // Note that in fact the outermost visible screen pixels do not lie exactly on the boundary (+1 or -1), but are biased by
-    // 0.5 screen pixel size inwards. Using these adjusted boundaries improves precision and results in
-    // samller number of pixels which require inscattering correction
-    float4 f4OutermostScreenPixelCoords = GetOutermostScreenPixelCoords();// xyzw = (left, bottom, right, top)
     float2 f2ExitPoint = lerp(f4OutermostScreenPixelCoords.xy, f4OutermostScreenPixelCoords.zw, f2ExitPointPosOnBnd);
     // GetEpipolarLineEntryPoint() gets exit point on SHRINKED boundary
     float2 f2EntryPoint = GetEpipolarLineEntryPoint(f2ExitPoint);
-
+    
 #if OPTIMIZE_SAMPLE_LOCATIONS
     // If epipolar slice is not invisible, advance its exit point if necessary
-    // Recall that all correct entry points are completely inside the [-1,1]x[-1,1] area
-    if( all(abs(f2EntryPoint) < 1) )
+    if( IsValidScreenLocation(f2EntryPoint) )
     {
         // Compute length of the epipolar line in screen pixels:
         float fEpipolarSliceScreenLen = length( (f2ExitPoint - f2EntryPoint) * SCREEN_RESLOUTION.xy / 2 );
@@ -408,8 +570,7 @@ void GenerateCoordinateTexturePS(SScreenSizeQuadVSOutput In,
     // If slice entry point is outside [-1,1]x[-1,1] area, the slice is completely invisible
     // and we can skip it from further processing.
     // Note that slice exit point can lie outside the screen, if sample locations are optimized
-    // Recall that all correct entry points are completely inside the [-1,1]x[-1,1] area
-    if( any(abs(f4SliceEndPoints.xy) > 1) )
+    if( !IsValidScreenLocation(f4SliceEndPoints.xy) )
     {
         // Discard invalid slices
         // Such slices will not be marked in the stencil and as a result will always be skipped
@@ -434,8 +595,7 @@ void GenerateCoordinateTexturePS(SScreenSizeQuadVSOutput In,
 
     // Compute interpolated position between entry and exit points:
     f2XY = lerp(f4SliceEndPoints.xy, f4SliceEndPoints.zw, fSamplePosOnEpipolarLine);
-    // All correct entry points are completely inside the [-1,1]x[-1,1] area
-    if( any(abs(f2XY) > 1) )
+    if( !IsValidScreenLocation(f2XY) )
     {
         // Discard pixels that fall behind the screen
         // This can happen if slice exit point was optimized
@@ -468,8 +628,8 @@ float4 RenderSliceUVDirInShadowMapTexturePS(SScreenSizeQuadVSOutput In) : SV_Tar
     uint uiSliceInd = In.m_f4Pos.x;
     // Load epipolar slice endpoints
     float4 f4SliceEndpoints = g_tex2DSliceEndPoints.Load(  uint3(uiSliceInd,0,0) );
-    // All correct entry points are completely inside the [-1,1]x[-1,1] area
-    if( any( abs(f4SliceEndpoints.xy) > 1 ) )
+    // All correct entry points are completely inside the [-1+1/W,1-1/W]x[-1+1/H,1-1/H] area
+    if( !IsValidScreenLocation(f4SliceEndpoints.xy) )
         return g_f4IncorrectSliceUVDirAndStart;
 
     uint uiCascadeInd = In.m_f4Pos.y;
@@ -815,7 +975,7 @@ void UnwarpEpipolarInsctrImage( SScreenSizeQuadVSOutput In,
         float fSliceLenSqr = dot(f2SliceDir, f2SliceDir);
         
         // Project current pixel onto the epipolar line
-        float fSamplePosOnLine = dot((In.m_f2PosPS - f4SliceEndpoints.xy), f2SliceDir) / fSliceLenSqr;
+        float fSamplePosOnLine = dot((In.m_f2PosPS - f4SliceEndpoints.xy), f2SliceDir) / max(fSliceLenSqr, 1e-8);
         // Compute index of the slice on the line
         // Note that the first sample on the line (fSamplePosOnLine==0) is exactly the Entry Point, while 
         // the last sample (fSamplePosOnLine==1) is exactly the Exit Point
@@ -867,7 +1027,16 @@ void UnwarpEpipolarInsctrImage( SScreenSizeQuadVSOutput In,
         // Multiply bilinear weights with the depth weights:
         float2 f2BilateralUWeights = float2(1-fUWeight, fUWeight) * f2DepthWeights * fSliceWeights[i];
         // If the sample projection is behind [0,1], we have to discard this slice
-        f2BilateralUWeights *= (abs(fSamplePosOnLine - 0.5) <= 0.5);
+        // We however must take into account the fact that if at least one sample from the two 
+        // bilinear sources is correct, the sample can still be properly computed
+        //        
+        //            -1       0       1                  N-2     N-1      N              Sample index
+        // |   X   |   X   |   X   |   X   |  ......   |   X   |   X   |   X   |   X   |
+        //         1-1/(N-1)   0    1/(N-1)                        1   1+1/(N-1)          fSamplePosOnLine   
+        //             |                                                   |
+        //             |<-------------------Clamp range------------------->|                   
+        //
+        f2BilateralUWeights *= (abs(fSamplePosOnLine - 0.5) < 0.5 + 1.f / (MAX_SAMPLES_IN_SLICE-1));
         // We now need to compute the following weighted summ:
         //f3FilteredSliceCol = 
         //    f2BilateralUWeights.x * g_tex2DScatteredColor.SampleLevel(samPoint, f2SctrColorUV, 0, int2(0,0)) +
@@ -895,22 +1064,27 @@ void UnwarpEpipolarInsctrImage( SScreenSizeQuadVSOutput In,
         fTotalWeight += dot(f2BilateralUWeights, 1);
     }
 
-    if( g_PPAttribs.m_bCorrectScatteringAtDepthBreaks && fTotalWeight < 1e-2 )
+#if CORRECT_INSCATTERING_AT_DEPTH_BREAKS
+    if( fTotalWeight < 1e-2 )
     {
         // Discarded pixels will keep 0 value in stencil and will be later
         // processed to correct scattering
         discard;
     }
+#endif
     
     f3Inscattering /= fTotalWeight;
     f3Extinction /= fTotalWeight;
 }
 
+float2 GetDensityIntegralAnalytic(float r, float mu, float d);
 float3 GetExtinction(in float3 f3StartPos, in float3 f3EndPos);
+float3 GetExtinctionUnverified(in float3 f3StartPos, in float3 f3EndPos, in float3 f3ViewDir, in float3 f3EarthCentre);
 
 float3 ApplyInscatteredRadiancePS(SScreenSizeQuadVSOutput In) : SV_Target
 {
-    float fCamSpaceZ = GetCamSpaceZ( ProjToUV(In.m_f2PosPS) );
+    float2 f2UV = ProjToUV(In.m_f2PosPS);
+    float fCamSpaceZ = GetCamSpaceZ( f2UV );
     
     float3 f3Inscttering, f3Extinction;
     UnwarpEpipolarInsctrImage(In, fCamSpaceZ, f3Inscttering, f3Extinction);
@@ -919,18 +1093,23 @@ float3 ApplyInscatteredRadiancePS(SScreenSizeQuadVSOutput In) : SV_Target
     [branch]
     if( !g_PPAttribs.m_bShowLightingOnly )
     {
-        f3BackgroundColor = g_tex2DColorBuffer.Load(int3(In.m_f4Pos.xy,0)).rgb;
+        f3BackgroundColor = g_tex2DColorBuffer.SampleLevel( samPointClamp, f2UV, 0).rgb;
         // fFarPlaneZ is pre-multiplied with 0.999999f
         f3BackgroundColor *= (fCamSpaceZ > g_CameraAttribs.fFarPlaneZ) ? g_LightAttribs.f4ExtraterrestrialSunColor.rgb : 1;
 
-#if EXTINCTION_EVAL_MODE == EXTINCTION_EVAL_MODE_LUT
+#if EXTINCTION_EVAL_MODE == EXTINCTION_EVAL_MODE_PER_PIXEL
         float3 f3ReconstructedPosWS = ProjSpaceXYZToWorldSpace(float3(In.m_f2PosPS.xy, fCamSpaceZ));
         f3Extinction = GetExtinction(g_CameraAttribs.f4CameraPos.xyz, f3ReconstructedPosWS);
 #endif
         f3BackgroundColor *= f3Extinction;
     }
 
+#if PERFORM_TONE_MAPPING
     return ToneMap(f3BackgroundColor + f3Inscttering);
+#else
+    const float DELTA = 0.00001;
+    return log( max(DELTA, dot(f3BackgroundColor + f3Inscttering, RGB_TO_LUMINANCE)) );
+#endif
 }
 
 technique11 ApplyInscatteredRadiance
@@ -1034,25 +1213,68 @@ technique11 RenderSampleLocations
 }
 
 
+float4 WorldParams2InsctrLUTCoords(float fHeight,
+                                   float fCosViewZenithAngle,
+                                   float fCosSunZenithAngle,
+                                   float fCosSunViewAngle,
+                                   in float4 f4PrevUVWQ = -1);
+
+float3 LookUpPrecomputedScattering(float3 f3StartPoint, 
+                                   float3 f3ViewDir, 
+                                   float3 f3EarthCentre,
+                                   float3 f3DirOnLight,
+                                   in Texture3D<float3> tex3DScatteringLUT,
+                                   inout float4 f4UVWQ)
+{
+    float3 f3EarthCentreToPointDir = f3StartPoint - f3EarthCentre;
+    float fDistToEarthCentre = length(f3EarthCentreToPointDir);
+    f3EarthCentreToPointDir /= fDistToEarthCentre;
+    float fHeightAboveSurface = fDistToEarthCentre - EARTH_RADIUS;
+    float fCosViewZenithAngle = dot( f3EarthCentreToPointDir, f3ViewDir    );
+    float fCosSunZenithAngle  = dot( f3EarthCentreToPointDir, f3DirOnLight );
+    float fCosSunViewAngle    = dot( f3ViewDir,               f3DirOnLight );
+
+    // Provide previous look-up coordinates
+    f4UVWQ = WorldParams2InsctrLUTCoords(fHeightAboveSurface, fCosViewZenithAngle,
+                                         fCosSunZenithAngle, fCosSunViewAngle, 
+                                         f4UVWQ);
+
+    float3 f3UVW0; 
+    f3UVW0.xy = f4UVWQ.xy;
+    float fQ0Slice = floor(f4UVWQ.w * PRECOMPUTED_SCTR_LUT_DIM.w - 0.5);
+    float fQWeight = (f4UVWQ.w * PRECOMPUTED_SCTR_LUT_DIM.w - 0.5) - fQ0Slice;
+    fQ0Slice = clamp(fQ0Slice, 0, PRECOMPUTED_SCTR_LUT_DIM.w-1);
+    float2 f2SliceMinMaxZ = float2(fQ0Slice, fQ0Slice+1)/PRECOMPUTED_SCTR_LUT_DIM.w + float2(0.5,-0.5) / (PRECOMPUTED_SCTR_LUT_DIM.z*PRECOMPUTED_SCTR_LUT_DIM.w);
+    f3UVW0.z =  (fQ0Slice + f4UVWQ.z) / PRECOMPUTED_SCTR_LUT_DIM.w;
+    f3UVW0.z = clamp(f3UVW0.z, f2SliceMinMaxZ.x, f2SliceMinMaxZ.y);
+    
+    float fQ1Slice = min(fQ0Slice+1, PRECOMPUTED_SCTR_LUT_DIM.w-1);
+    float fNextSliceOffset = (fQ1Slice - fQ0Slice) / PRECOMPUTED_SCTR_LUT_DIM.w;
+    float3 f3UVW1 = f3UVW0 + float3(0,0,fNextSliceOffset);
+    float3 f3Insctr0 = tex3DScatteringLUT.SampleLevel(samLinearClamp, f3UVW0, 0);
+    float3 f3Insctr1 = tex3DScatteringLUT.SampleLevel(samLinearClamp, f3UVW1, 0);
+    float3 f3Inscattering = lerp(f3Insctr0, f3Insctr1, fQWeight);
+
+    return f3Inscattering;
+}
+
 float2 GetNetParticleDensity(in float fHeightAboveSurface,
-                             in float fCosZenithAngle,
-                             uniform const bool bIsOccluded)
+                             in float fCosZenithAngle)
 {
     float fRelativeHeightAboveSurface = fHeightAboveSurface / ATM_TOP_HEIGHT;
-    return (bIsOccluded ? g_tex2DOccludedNetDensityToAtmTop : g_tex2DUnoccludedNetDensityToAtmTop).SampleLevel(samLinearClamp, float2(fRelativeHeightAboveSurface, fCosZenithAngle*0.5+0.5), 0).xy;
+    return g_tex2DOccludedNetDensityToAtmTop.SampleLevel(samLinearClamp, float2(fRelativeHeightAboveSurface, fCosZenithAngle*0.5+0.5), 0).xy;
 }
 
 float2 GetNetParticleDensity(in float3 f3Pos,
                              in float3 f3EarthCentre,
-                             in float3 f3RayDir,
-                             uniform const bool bIsOccluded)
+                             in float3 f3RayDir)
 {
     float3 f3EarthCentreToPointDir = f3Pos - f3EarthCentre;
     float fDistToEarthCentre = length(f3EarthCentreToPointDir);
     f3EarthCentreToPointDir /= fDistToEarthCentre;
     float fHeightAboveSurface = fDistToEarthCentre - EARTH_RADIUS;
     float fCosZenithAngle = dot( f3EarthCentreToPointDir, f3RayDir );
-    return GetNetParticleDensity(fHeightAboveSurface, fCosZenithAngle, bIsOccluded);
+    return GetNetParticleDensity(fHeightAboveSurface, fCosZenithAngle);
 }
 
 void ApplyPhaseFunctions(inout float3 f3RayleighInscattering,
@@ -1086,7 +1308,7 @@ void GetAtmosphereProperties(in float3 f3Pos,
 
     // Get net particle density from the integration point to the top of the atmosphere:
     float fCosSunZenithAngleForCurrPoint = dot( f3EarthCentreToPointDir, f3DirOnLight );
-    f2NetParticleDensityToAtmTop = GetNetParticleDensity(fHeightAboveSurface, fCosSunZenithAngleForCurrPoint, true);
+    f2NetParticleDensityToAtmTop = GetNetParticleDensity(fHeightAboveSurface, fCosSunZenithAngleForCurrPoint);
 }
 
 // This function computes differential inscattering for the given particle densities 
@@ -1172,6 +1394,40 @@ void ComputeInsctrIntegral(in float3 f3RayStart,
     }
 }
 
+void IntegrateUnshadowedInscattering(in float3 f3RayStart, 
+                                     in float3 f3RayEnd,
+                                     in float3 f3ViewDir,
+                                     in float3 f3EarthCentre,
+                                     in float3 f3DirOnLight,
+                                     uniform const float fNumSteps,
+                                     out float3 f3Inscattering,
+                                     out float3 f3Extinction)
+{
+    float2 f2NetParticleDensityFromCam = 0;
+    float3 f3RayleighInscattering = 0;
+    float3 f3MieInscattering = 0;
+    ComputeInsctrIntegral( f3RayStart,
+                           f3RayEnd,
+                           f3EarthCentre,
+                           f3DirOnLight,
+                           f2NetParticleDensityFromCam,
+                           f3RayleighInscattering,
+                           f3MieInscattering,
+                           fNumSteps);
+
+    float3 f3TotalRlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2NetParticleDensityFromCam.x;
+    float3 f3TotalMieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb      * f2NetParticleDensityFromCam.y;
+    f3Extinction = exp( -(f3TotalRlghOpticalDepth + f3TotalMieOpticalDepth) );
+
+    // Apply phase function
+    // Note that cosTheta = dot(DirOnCamera, LightDir) = dot(ViewDir, DirOnLight) because
+    // DirOnCamera = -ViewDir and LightDir = -DirOnLight
+    float cosTheta = dot(f3ViewDir, f3DirOnLight);
+    ApplyPhaseFunctions(f3RayleighInscattering, f3MieInscattering, cosTheta);
+
+    f3Inscattering = f3RayleighInscattering + f3MieInscattering;
+}
+
 void ComputeUnshadowedInscattering(float2 f2SampleLocation, 
                                    float fCamSpaceZ,
                                    uniform const float fNumSteps,
@@ -1199,30 +1455,42 @@ void ComputeUnshadowedInscattering(float2 f2SampleLocation,
         fRayLength = +FLT_MAX;
     float3 f3RayEnd = f3CameraPos + f3ViewDir * min(fRayLength, f2RayAtmTopIsecs.y);
             
-    float2 f2NetParticleDensityFromCam = 0;
-    float3 f3RayleighInscattering = 0;
-    float3 f3MieInscattering = 0;
-    ComputeInsctrIntegral( f3RayStart,
-                           f3RayEnd,
-                           f3EarthCentre,
-                           g_LightAttribs.f4DirOnLight.xyz,
-                           f2NetParticleDensityFromCam,
-                           f3RayleighInscattering,
-                           f3MieInscattering,
-                           fNumSteps);
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
+    IntegrateUnshadowedInscattering(f3RayStart, 
+                                    f3RayEnd,
+                                    f3ViewDir,
+                                    f3EarthCentre,
+                                    g_LightAttribs.f4DirOnLight.xyz,
+                                    fNumSteps,
+                                    f3Inscattering,
+                                    f3Extinction);
+#endif
 
-    float3 f3TotalRlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2NetParticleDensityFromCam.x;
-    float3 f3TotalMieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb      * f2NetParticleDensityFromCam.y;
-    f3Extinction = exp( -(f3TotalRlghOpticalDepth + f3TotalMieOpticalDepth) );
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT || MULTIPLE_SCATTERING_MODE > MULTIPLE_SCTR_MODE_NONE
 
-    f3RayleighInscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
-    f3MieInscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
-    
-    // Apply phase function
-    float cosTheta = dot(f3ViewDir, g_LightAttribs.f4DirOnLight.xyz);
-    ApplyPhaseFunctions(f3RayleighInscattering, f3MieInscattering, cosTheta);
+#if MULTIPLE_SCATTERING_MODE > MULTIPLE_SCTR_MODE_NONE
+    #if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
+        Texture3D<float3> tex3DSctrLUT = g_tex3DMultipleSctrLUT;
+    #elif SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_NONE || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
+        Texture3D<float3> tex3DSctrLUT = g_tex3DHighOrderSctrLUT;
+    #endif
+#else
+    Texture3D<float3> tex3DSctrLUT = g_tex3DSingleSctrLUT;
+#endif
 
-    f3Inscattering = f3RayleighInscattering + f3MieInscattering;
+    f3Extinction = GetExtinctionUnverified(f3RayStart, f3RayEnd, f3ViewDir, f3EarthCentre);
+
+    // To avoid artifacts, we must be consistent when performing look-ups into the scattering texture, i.e.
+    // we must assure that if the first look-up is above (below) horizon, then the second look-up
+    // is also above (below) horizon. 
+    float4 f4UVWQ = -1;
+    f3Inscattering +=                LookUpPrecomputedScattering(f3RayStart, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ); 
+    // Provide previous look-up coordinates to the function to assure that look-ups are consistent
+    f3Inscattering -= f3Extinction * LookUpPrecomputedScattering(f3RayEnd,   f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ);
+
+#endif
+
+
 }
 
 // This function calculates inscattered light integral over the ray from the camera to 
@@ -1245,22 +1513,13 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
     const float3 f3EarthCentre = float3(0, -EARTH_RADIUS, 0);
 
     // Intersect the ray with the top of the atmosphere and the Earth:
-    float2 f2RayAtmTopIsecs;
-#if CASCADE_PROCESSING_MODE == CASCADE_PROCESSING_MODE_SINGLE_PASS
-    GetRaySphereIntersection(f3CameraPos, f3ViewDir, f3EarthCentre, ATM_TOP_RADIUS, f2RayAtmTopIsecs);
-#else
-    // In case of multi-pass rendering we also need intersection with the Earth,
-    // which will be required to compute optical depth to the ray start point
-    float2 f2RayEarthIsecs;
     float4 f4Isecs;
     GetRaySphereIntersection2(f3CameraPos, f3ViewDir, f3EarthCentre, 
-                              float2(ATM_TOP_RADIUS, EARTH_RADIUS), 
-                              f4Isecs);
-    f2RayAtmTopIsecs = f4Isecs.xy; 
-    f2RayEarthIsecs  = f4Isecs.zw;
-#endif
+                              float2(ATM_TOP_RADIUS, EARTH_RADIUS), f4Isecs);
+    float2 f2RayAtmTopIsecs = f4Isecs.xy; 
+    float2 f2RayEarthIsecs  = f4Isecs.zw;
     
-    if( f2RayAtmTopIsecs.y < 0 )
+    if( f2RayAtmTopIsecs.y <= 0 )
     {
         //                                                          view dir
         //                                                        /
@@ -1276,22 +1535,37 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         return 0;
     }
 
-    // Update ray length to the top of the atmosphere if the ray does not intersect terrain
+    // Restrict the camera position to the top of the atmosphere
+    float fDistToAtmosphere = max(f2RayAtmTopIsecs.x, 0);
+    float3 f3RestrainedCameraPos = f3CameraPos + fDistToAtmosphere * f3ViewDir;
+
+    // Limit the ray length by the distance to the top of the atmosphere if the ray does not hit terrain
     float fOrigRayLength = fFullRayLength;
     if( fRayEndCamSpaceZ > g_CameraAttribs.fFarPlaneZ ) // fFarPlaneZ is pre-multiplied with 0.999999f
         fFullRayLength = +FLT_MAX;
     // Limit the ray length by the distance to the point where the ray exits the atmosphere
     fFullRayLength = min(fFullRayLength, f2RayAtmTopIsecs.y);
+
+    // If there is an intersection with the Earth surface, limit the tracing distance to the intersection
+    if( f2RayEarthIsecs.x > 0 )
+    {
+        fFullRayLength = min(fFullRayLength, f2RayEarthIsecs.x);
+    }
+
     fRayEndCamSpaceZ *= fFullRayLength / fOrigRayLength; 
     
     float3 f3RayleighInscattering = 0;
     float3 f3MieInscattering = 0;
     float2 f2ParticleNetDensityFromCam = 0;
-    float3 f3RayEnd, f3RayStart;
+    float3 f3RayEnd = 0, f3RayStart;
     
+    // Note that cosTheta = dot(DirOnCamera, LightDir) = dot(ViewDir, DirOnLight) because
+    // DirOnCamera = -ViewDir and LightDir = -DirOnLight
     float cosTheta = dot(f3ViewDir, g_LightAttribs.f4DirOnLight.xyz);
     
     float fCascadeEndCamSpaceZ = 0;
+    float fTotalLitLength = 0, fTotalMarchedLength = 0; // Required for multiple scattering
+    float fDistToFirstLitSection = -1; // Used only in when SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
 
 #if CASCADE_PROCESSING_MODE == CASCADE_PROCESSING_MODE_SINGLE_PASS
     for(; uiCascadeInd < (uint)g_PPAttribs.m_iNumCascades; ++uiCascadeInd, ++fCascadeInd)
@@ -1335,6 +1609,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         //                /                                              /
         //
         fDistToRayStart = max(fDistToRayStart, f2RayAtmTopIsecs.x);
+        fDistToRayEnd   = max(fDistToRayEnd,   f2RayAtmTopIsecs.x);
         
         // To properly compute scattering from the space, we must 
         // set up ray end position before extiting the loop
@@ -1342,13 +1617,10 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         f3RayStart = f3CameraPos + f3ViewDir * fDistToRayStart;
 
 #if CASCADE_PROCESSING_MODE != CASCADE_PROCESSING_MODE_SINGLE_PASS
-        // The most efficient way to avoid numeric issues is to reverse the ray direction 
-        // at horizontal orientation, when optical depth in both directions is the same
-        // Switching at horizon creates very severe artifacts when looking from space
-        float fInverseRay = (f2RayEarthIsecs.x > 0) ? -1.f : +1.f;
-        float2 f2DensityAlongViewRayFromStart  = GetNetParticleDensity(f3RayStart,                                        f3EarthCentre, fInverseRay*f3ViewDir, false);
-        float2 f2DensityAlongViewRayFromCamera = GetNetParticleDensity(f3CameraPos + max(f2RayAtmTopIsecs.x,0)*f3ViewDir, f3EarthCentre, fInverseRay*f3ViewDir, false);
-        f2ParticleNetDensityFromCam = max( fInverseRay*(f2DensityAlongViewRayFromCamera - f2DensityAlongViewRayFromStart), 0 );
+        float r = length(f3RestrainedCameraPos - f3EarthCentre);
+        float fCosZenithAngle = dot(f3RestrainedCameraPos-f3EarthCentre, f3ViewDir) / r;
+        float fDist = max(fDistToRayStart - fDistToAtmosphere, 0);
+        f2ParticleNetDensityFromCam = GetDensityIntegralAnalytic(r, fCosZenithAngle, fDist);
 #endif
 
         float fRayLength = fDistToRayEnd - fDistToRayStart;
@@ -1364,16 +1636,6 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                 return 0;
 #endif
         }
-
-        
-        
-        // If there is an intersection with the Earth surface, limit the tracing distance to the intersection
-#if 0
-        if( f2RayEarthIsecs.x > 0 )
-        {
-            fRayLength = min(fRayLength, f2RayEarthIsecs.x);
-        }
-#endif
 
         // We trace the ray in the light projection space, not in the world space
         // Compute shadow map UV coordiantes of the ray end point and its depth in the light space
@@ -1434,7 +1696,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         float3 f3ShadowMapUVAndDepthStep = f3ShadowMapTraceDir * fShadowMapUVStepLen;
     
         // March the ray
-        float fTotalMarchedDistance = 0;
+        float fDistanceMarchedInCascade = 0;
         float3 f3CurrShadowMapUVAndDepthInLightSpace = f3StartUVAndDepthInLightSpace.xyz;
 
         // The following variables are used only if 1D min map optimization is enabled
@@ -1450,7 +1712,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         float fMaxShadowMapStep = min(fMinWorldSpaceStep/fRayStepLengthWS, g_PPAttribs.m_uiMaxShadowMapStep);
 
         [loop]
-        while( fTotalMarchedDistance < fRayLength )
+        while( fDistanceMarchedInCascade < fRayLength )
         {
             // Clamp depth to a very small positive value to avoid z-fighting at camera location
             float fCurrDepthInLightSpace = max(f3CurrShadowMapUVAndDepthInLightSpace.z, 1e-7);
@@ -1493,6 +1755,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                     // Load 1D min/max depths
                     float2 f2CurrMinMaxDepth = g_tex2DMinMaxLightSpaceDepth.Load( uint3( (uiCurrSamplePos>>uiCurrTreeLevel) + iLevelDataOffset, uiMinMaxTexYInd, 0) );
                 
+                    // Since we use complimentary depth buffer, the relations are reversed
                     IsInLight = all( f2StartEndDepthOnRaySection >= f2CurrMinMaxDepth.yy );
                     bool bIsInShadow = all( f2StartEndDepthOnRaySection < f2CurrMinMaxDepth.xx );
 
@@ -1517,9 +1780,11 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                 IsInLight = g_tex2DLightSpaceDepthMap.SampleCmpLevelZero( samComparison, float3(f3CurrShadowMapUVAndDepthInLightSpace.xy,fCascadeInd), fCurrDepthInLightSpace ).x;
             }
 
-            float fRemainingDist = max(fRayLength - fTotalMarchedDistance, 0);
+            float fRemainingDist = max(fRayLength - fDistanceMarchedInCascade, 0);
             float fIntegrationStep = min(fRayStepLengthWS * fStep, fRemainingDist);
-            float fIntegrationDist = fTotalMarchedDistance + fIntegrationStep/2;
+            float fIntegrationDist = fDistanceMarchedInCascade + fIntegrationStep/2;
+
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
             float3 f3CurrPos = f3RayStart + f3ViewDir * fIntegrationDist;
 
             // Calculate integration point height above the SPHERICAL Earth surface:
@@ -1536,7 +1801,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
 
             // Get net particle density from the integration point to the top of the atmosphere:
             float fCosSunZenithAngle = dot( f3EarthCentreToPointDir, g_LightAttribs.f4DirOnLight.xyz );
-            float2 f2NetParticleDensityToAtmTop = GetNetParticleDensity(fHeightAboveSurface, fCosSunZenithAngle, true);
+            float2 f2NetParticleDensityToAtmTop = GetNetParticleDensity(fHeightAboveSurface, fCosSunZenithAngle);
         
             // Compute total particle density from the top of the atmosphere through the integraion point to camera
             float2 f2TotalParticleDensity = f2ParticleNetDensityFromCam + f2NetParticleDensityToAtmTop;
@@ -1554,13 +1819,32 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
             f2ParticleDensity *= fIntegrationStep * IsInLight;
             f3RayleighInscattering += f2ParticleDensity.x * f3TotalExtinction;
             f3MieInscattering      += f2ParticleDensity.y * f3TotalExtinction;
+#endif
 
+#if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
+            // Store the distance where the ray first enters the light
+            fDistToFirstLitSection = (fDistToFirstLitSection < 0 && IsInLight > 0) ? fTotalMarchedLength : fDistToFirstLitSection;
+#endif
             f3CurrShadowMapUVAndDepthInLightSpace += f3ShadowMapUVAndDepthStep * fStep;
             uiCurrSamplePos += 1 << uiCurrTreeLevel; // int -> float conversions are slow
-            fTotalMarchedDistance += fRayStepLengthWS * fStep;
+            fDistanceMarchedInCascade += fRayStepLengthWS * fStep;
+
+#if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
+            fTotalLitLength += fIntegrationStep * IsInLight;
+            fTotalMarchedLength += fIntegrationStep;
+#endif
         }
     }
 
+#if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
+    // If the whole ray is in shadow, set the distance to the first lit section to the
+    // total marched distance
+    if( fDistToFirstLitSection < 0 )
+        fDistToFirstLitSection = fTotalMarchedLength;
+#endif
+
+    float3 f3RemainingRayStart = 0;
+    float fRemainingLength = 0;
     if( 
 #if CASCADE_PROCESSING_MODE != CASCADE_PROCESSING_MODE_SINGLE_PASS
         (int)uiCascadeInd == g_PPAttribs.m_iNumCascades-1 && 
@@ -1568,13 +1852,14 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         fRayEndCamSpaceZ > fCascadeEndCamSpaceZ 
        )
     {
-        f3RayStart = f3RayEnd;
+        f3RemainingRayStart = f3RayEnd;
         f3RayEnd = f3CameraPos + fFullRayLength * f3ViewDir;
-        float fRemainingLength = length(f3RayEnd - f3RayStart);
+        fRemainingLength = length(f3RayEnd - f3RemainingRayStart);
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
         // Do not allow integration step become less than 20 km
         float fMinStep = 20000.f;
         float fMumSteps = max(10, ceil(fRemainingLength/fMinStep) );
-        ComputeInsctrIntegral(f3RayStart,
+        ComputeInsctrIntegral(f3RemainingRayStart,
                               f3RayEnd,
                               f3EarthCentre,
                               g_LightAttribs.f4DirOnLight.xyz,
@@ -1582,17 +1867,93 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                               f3RayleighInscattering,
                               f3MieInscattering,
                               fMumSteps);
+#endif
     }
 
-    f3RayleighInscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
-    f3MieInscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
-    
+    float3 f3InsctrIntegral = 0;
+
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
     // Apply phase functions
+    // Note that cosTheta = dot(DirOnCamera, LightDir) = dot(ViewDir, DirOnLight) because
+    // DirOnCamera = -ViewDir and LightDir = -DirOnLight
     ApplyPhaseFunctions(f3RayleighInscattering, f3MieInscattering, cosTheta);
 
-    float3 f3InsctrIntegral = f3RayleighInscattering + f3MieInscattering;
+    f3InsctrIntegral = f3RayleighInscattering + f3MieInscattering;
+#endif
 
-    return f3InsctrIntegral;
+#if CASCADE_PROCESSING_MODE == CASCADE_PROCESSING_MODE_SINGLE_PASS
+    // Note that the first cascade used for ray marching must contain camera within it
+    // otherwise this expression might fail
+    f3RayStart = f3CameraPos + max(0, f2RayAtmTopIsecs.x) * f3ViewDir;
+#endif
+
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT || MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED
+
+#if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED
+    #if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
+        Texture3D<float3> tex3DSctrLUT = g_tex3DMultipleSctrLUT;
+    #elif SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_NONE || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
+        Texture3D<float3> tex3DSctrLUT = g_tex3DHighOrderSctrLUT;
+    #endif
+#else
+    Texture3D<float3> tex3DSctrLUT = g_tex3DSingleSctrLUT;
+#endif
+
+    float3 f3MultipleScattering = 0;
+    if( fTotalLitLength > 0 )
+    {    
+        float3 f3LitSectionStart = f3RayStart + fDistToFirstLitSection * f3ViewDir;
+        float3 f3LitSectionEnd = f3LitSectionStart + fTotalLitLength * f3ViewDir;
+
+        float3 f3ExtinctionToStart = GetExtinctionUnverified(f3RestrainedCameraPos, f3LitSectionStart, f3ViewDir, f3EarthCentre);
+        float4 f4UVWQ = -1;
+        f3MultipleScattering = f3ExtinctionToStart * LookUpPrecomputedScattering(f3LitSectionStart, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ); 
+        
+        float3 f3ExtinctionToEnd = GetExtinctionUnverified(f3RestrainedCameraPos, f3LitSectionEnd, f3ViewDir,  f3EarthCentre);
+        // To avoid artifacts, we must be consistent when performing look-ups into the scattering texture, i.e.
+        // we must assure that if the first look-up is above (below) horizon, then the second look-up
+        // is also above (below) horizon.
+        // We provide previous look-up coordinates to the function so that it is able to figure out where the first look-up
+        // was performed
+        f3MultipleScattering -= f3ExtinctionToEnd * LookUpPrecomputedScattering(f3LitSectionEnd, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ);
+        
+        f3InsctrIntegral += max(f3MultipleScattering, 0);
+    }
+
+    // Add contribution from the reminder of the ray behind the largest cascade
+    if( fRemainingLength > 0 )
+    {
+        float3 f3Extinction = GetExtinctionUnverified(f3RestrainedCameraPos, f3RemainingRayStart, f3ViewDir, f3EarthCentre);
+        float4 f4UVWQ = -1;
+        float3 f3RemainingInsctr = 
+            f3Extinction * LookUpPrecomputedScattering(f3RemainingRayStart, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ);
+        
+        f3Extinction = GetExtinctionUnverified(f3RestrainedCameraPos, f3RayEnd, f3ViewDir, f3EarthCentre);
+        f3RemainingInsctr -= 
+            f3Extinction * LookUpPrecomputedScattering(f3RayEnd, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, tex3DSctrLUT, f4UVWQ);
+
+        f3InsctrIntegral += max(f3RemainingInsctr, 0);
+    }
+#endif
+
+#if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_UNOCCLUDED
+    {
+        float3 f3HighOrderScattering = 0, f3Extinction = 0;
+        
+        float4 f4UVWQ = -1;
+        f3Extinction = GetExtinctionUnverified(f3RestrainedCameraPos, f3RayStart, f3ViewDir, f3EarthCentre);
+        f3HighOrderScattering += f3Extinction * LookUpPrecomputedScattering(f3RayStart, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, g_tex3DHighOrderSctrLUT, f4UVWQ); 
+        
+        f3Extinction = GetExtinctionUnverified(f3RestrainedCameraPos, f3RayEnd, f3ViewDir, f3EarthCentre);
+        // We provide previous look-up coordinates to the function so that it is able to figure out where the first look-up
+        // was performed
+        f3HighOrderScattering -= f3Extinction * LookUpPrecomputedScattering(f3RayEnd, f3ViewDir, f3EarthCentre, g_LightAttribs.f4DirOnLight.xyz, g_tex3DHighOrderSctrLUT, f4UVWQ); 
+
+        f3InsctrIntegral += f3HighOrderScattering;
+    }
+#endif
+
+    return f3InsctrIntegral * g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
 }
 
 float3 RayMarchMinMaxOptPS(SScreenSizeQuadVSOutput In) : SV_TARGET
@@ -1616,6 +1977,7 @@ float3 RayMarchMinMaxOptPS(SScreenSizeQuadVSOutput In) : SV_TARGET
 #else
     float3 f3Inscattering, f3Extinction;
     ComputeUnshadowedInscattering(f2SampleLocation, fRayEndCamSpaceZ, g_PPAttribs.m_uiInstrIntegralSteps, f3Inscattering, f3Extinction);
+    f3Inscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
     return f3Inscattering;
 #endif
 }
@@ -1640,6 +2002,7 @@ float3 RayMarchPS(SScreenSizeQuadVSOutput In) : SV_TARGET
 #else
     float3 f3Inscattering, f3Extinction;
     ComputeUnshadowedInscattering(f2SampleLocation, fRayEndCamSpaceZ, g_PPAttribs.m_uiInstrIntegralSteps, f3Inscattering, f3Extinction);
+    f3Inscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
     return f3Inscattering;
 #endif
 }
@@ -1689,6 +2052,7 @@ float3 FixInscatteredRadiancePS(SScreenSizeQuadVSOutput In) : SV_Target
 #else
     float3 f3Inscattering, f3Extinction;
     ComputeUnshadowedInscattering(In.m_f2PosPS.xy, fRayEndCamSpaceZ, g_PPAttribs.m_uiInstrIntegralSteps, f3Inscattering, f3Extinction);
+    f3Inscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
     return f3Inscattering;
 #endif
 
@@ -1724,9 +2088,15 @@ float3 FixAndApplyInscatteredRadiancePS(SScreenSizeQuadVSOutput In) : SV_Target
 #else
     float3 f3InsctrColor, f3Extinction;
     ComputeUnshadowedInscattering(In.m_f2PosPS.xy, fCamSpaceZ, g_PPAttribs.m_uiInstrIntegralSteps, f3InsctrColor, f3Extinction);
+    f3InsctrColor *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
 #endif
 
-    return ToneMap(f3BackgroundColor + f3InsctrColor.rgb);
+#if PERFORM_TONE_MAPPING
+    return ToneMap(f3BackgroundColor + f3InsctrColor);
+#else
+    const float DELTA = 0.00001;
+    return log( max(DELTA, dot(f3BackgroundColor + f3InsctrColor, RGB_TO_LUMINANCE)) );
+#endif
 }
 
 technique11 FixInscatteredRadiance
@@ -1754,12 +2124,14 @@ void RenderCoarseUnshadowedInsctrPS(SScreenSizeQuadVSOutput In,
     float fCamSpaceZ =  g_tex2DEpipolarCamSpaceZ.Load( uint3(In.m_f4Pos.xy, 0) );
     float2 f2SampleLocation = g_tex2DCoordinates.Load( uint3(In.m_f4Pos.xy, 0) );
 #if EXTINCTION_EVAL_MODE != EXTINCTION_EVAL_MODE_EPIPOLAR
-    float3 f3Extinction;
+    float3 f3Extinction = 1;
 #endif
+
     ComputeUnshadowedInscattering(f2SampleLocation, fCamSpaceZ, 
                                   7, // Use hard-coded constant here so that compiler can optimize the code
                                      // more efficiently
                                   f3Inscattering, f3Extinction);
+    f3Inscattering *= g_LightAttribs.f4ExtraterrestrialSunColor.rgb;
 }
 
 technique11 RenderCoarseUnshadowedInsctr
@@ -1783,13 +2155,18 @@ float2 IntegrateParticleDensity(in float3 f3Start,
 {
     float3 f3Step = (f3End - f3Start) / fNumSteps;
     float fStepLen = length(f3Step);
+        
+    float fStartHeightAboveSurface = abs( length(f3Start - f3EarthCentre) - g_MediaParams.fEarthRadius );
+    float2 f2PrevParticleDensity = exp( -fStartHeightAboveSurface / g_MediaParams.f2ParticleScaleHeight );
+
     float2 f2ParticleNetDensity = 0;
-    for(float fStepNum = 0.5; fStepNum < fNumSteps; fStepNum += 1.f)
+    for(float fStepNum = 1; fStepNum <= fNumSteps; fStepNum += 1.f)
     {
         float3 f3CurrPos = f3Start + f3Step * fStepNum;
         float fHeightAboveSurface = abs( length(f3CurrPos - f3EarthCentre) - g_MediaParams.fEarthRadius );
         float2 f2ParticleDensity = exp( -fHeightAboveSurface / g_MediaParams.f2ParticleScaleHeight );
-        f2ParticleNetDensity += f2ParticleDensity * fStepLen;
+        f2ParticleNetDensity += (f2ParticleDensity + f2PrevParticleDensity) * fStepLen / 2.f;
+        f2PrevParticleDensity = f2ParticleDensity;
     }
     return f2ParticleNetDensity;
 }
@@ -1829,14 +2206,12 @@ float2 IntegrateParticleDensityAlongRay(in float3 f3Pos,
     return IntegrateParticleDensity(f3Pos, f3RayEnd, f3EarthCentre, fNumSteps);
 }
 
-
-
-void PrecomputeNetDensityToAtmTopTechPS( SScreenSizeQuadVSOutput In,
-                                         out float2 f2OccludedNetDensity : SV_Target0,
-                                         out float2 f2UnoccludedNetDensity  : SV_Target1 )
+float2 PrecomputeNetDensityToAtmTopPS( SScreenSizeQuadVSOutput In ) : SV_Target0
 {
     float2 f2UV = ProjToUV(In.m_f2PosPS);
-    float fStartHeight = lerp(0, g_MediaParams.fAtmTopHeight, f2UV.x);
+    // Do not allow start point be at the Earth surface and on the top of the atmosphere
+    float fStartHeight = clamp( lerp(0, g_MediaParams.fAtmTopHeight, f2UV.x), 10, g_MediaParams.fAtmTopHeight-10 );
+
     float fCosTheta = -In.m_f2PosPS.y;
     float fSinTheta = sqrt( saturate(1 - fCosTheta*fCosTheta) );
     float3 f3RayStart = float3(0, 0, fStartHeight);
@@ -1845,8 +2220,7 @@ void PrecomputeNetDensityToAtmTopTechPS( SScreenSizeQuadVSOutput In,
     float3 f3EarthCentre = float3(0,0,-g_MediaParams.fEarthRadius);
 
     const float fNumSteps = 200;
-    f2OccludedNetDensity = IntegrateParticleDensityAlongRay(f3RayStart, f3RayDir, f3EarthCentre, fNumSteps, true);
-    f2UnoccludedNetDensity = IntegrateParticleDensityAlongRay(f3RayStart, f3RayDir, f3EarthCentre, fNumSteps, false);
+    return IntegrateParticleDensityAlongRay(f3RayStart, f3RayDir, f3EarthCentre, fNumSteps, true);
 }
 
 
@@ -1860,8 +2234,49 @@ technique11 PrecomputeNetDensityToAtmTopTech
 
         SetVertexShader( CompileShader(vs_5_0, GenerateScreenSizeQuadVS() ) );
         SetGeometryShader( NULL );
-        SetPixelShader( CompileShader(ps_5_0, PrecomputeNetDensityToAtmTopTechPS() ) );
+        SetPixelShader( CompileShader(ps_5_0, PrecomputeNetDensityToAtmTopPS() ) );
     }
+}
+
+// This function for analytical evaluation of particle density integral is 
+// provided by Eric Bruneton
+// http://www-evasion.inrialpes.fr/Membres/Eric.Bruneton/
+//
+// optical depth for ray (r,mu) of length d, using analytic formula
+// (mu=cos(view zenith angle)), intersections with ground ignored
+float2 GetDensityIntegralAnalytic(float r, float mu, float d) 
+{
+    float2 f2A = sqrt( (0.5/PARTICLE_SCALE_HEIGHT.xy) * r );
+    float4 f4A01 = f2A.xxyy * float2(mu, mu + d / r).xyxy;
+    float4 f4A01s = sign(f4A01);
+    float4 f4A01sq = f4A01*f4A01;
+    
+    float2 f2X;
+    f2X.x = f4A01s.y > f4A01s.x ? exp(f4A01sq.x) : 0.0;
+    f2X.y = f4A01s.w > f4A01s.z ? exp(f4A01sq.z) : 0.0;
+    
+    float4 f4Y = f4A01s / (2.3193*abs(f4A01) + sqrt(1.52*f4A01sq + 4.0)) * float3(1.0, exp(-d/PARTICLE_SCALE_HEIGHT.xy*(d/(2.0*r)+mu))).xyxz;
+
+    return sqrt((6.2831*PARTICLE_SCALE_HEIGHT)*r) * exp((EARTH_RADIUS-r)/PARTICLE_SCALE_HEIGHT.xy) * (f2X + float2( dot(f4Y.xy, float2(1.0, -1.0)), dot(f4Y.zw, float2(1.0, -1.0)) ));
+}
+
+float3 GetExtinctionUnverified(in float3 f3StartPos, in float3 f3EndPos, float3 f3EyeDir, float3 f3EarthCentre)
+{
+#if 0
+    float2 f2ParticleDensity = IntegrateParticleDensity(f3StartPos, f3EndPos, f3EarthCentre, 20);
+#else
+    float r = length(f3StartPos-f3EarthCentre);
+    float fCosZenithAngle = dot(f3StartPos-f3EarthCentre, f3EyeDir) / r;
+    float2 f2ParticleDensity = GetDensityIntegralAnalytic(r, fCosZenithAngle, length(f3StartPos - f3EndPos));
+#endif
+
+    // Get optical depth
+    float3 f3TotalRlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2ParticleDensity.x;
+    float3 f3TotalMieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb * f2ParticleDensity.y;
+        
+    // Compute extinction
+    float3 f3Extinction = exp( -(f3TotalRlghOpticalDepth + f3TotalMieOpticalDepth) );
+    return f3Extinction;
 }
 
 float3 GetExtinction(in float3 f3StartPos, in float3 f3EndPos)
@@ -1872,12 +2287,9 @@ float3 GetExtinction(in float3 f3StartPos, in float3 f3EndPos)
 
     float3 f3EarthCentre = /*g_CameraAttribs.f4CameraPos.xyz*float3(1,0,1)*/ - float3(0,1,0) * EARTH_RADIUS;
 
-    float4 f4RayEarthAndAtmIsecs; 
-    // Compute intersections of the view ray with the atmosphere and the Earth sphere
-    GetRaySphereIntersection2(f3StartPos, f3EyeDir, f3EarthCentre, 
-                              float2(EARTH_RADIUS, ATM_TOP_RADIUS), 
-                              f4RayEarthAndAtmIsecs);
-    float2 f2RayAtmTopIsecs = f4RayEarthAndAtmIsecs.zw;
+    float2 f2RayAtmTopIsecs; 
+    // Compute intersections of the view ray with the atmosphere
+    GetRaySphereIntersection(f3StartPos, f3EyeDir, f3EarthCentre, ATM_TOP_RADIUS, f2RayAtmTopIsecs);
     // If the ray misses the atmosphere, there is no extinction
     if( f2RayAtmTopIsecs.y < 0 )return 1;
 
@@ -1885,27 +2297,423 @@ float3 GetExtinction(in float3 f3StartPos, in float3 f3EndPos)
     f3EndPos = f3StartPos + f3EyeDir * min(f2RayAtmTopIsecs.y, fRayLength);
     f3StartPos += f3EyeDir * max(f2RayAtmTopIsecs.x, 0);
 
-    float2 f2RayEarthIsecs = f4RayEarthAndAtmIsecs.xy;
-    float fInverseRay = (f2RayEarthIsecs.x > 0) ? -1.f : +1.f;
-
-    float2 f2DensityAlongViewRayFromStart = fInverseRay*GetNetParticleDensity(f3StartPos, f3EarthCentre, fInverseRay*f3EyeDir, false);
-    float2 f2DensityAlongViewRayFromEnd   = fInverseRay*GetNetParticleDensity(f3EndPos, f3EarthCentre, fInverseRay*f3EyeDir, false);
-
-    // Compute total particle density from the top of the atmosphere through the integraion point to camera
-    float2 f2ParticleDensity = max(f2DensityAlongViewRayFromStart - f2DensityAlongViewRayFromEnd,0);
-        
-    // Get optical depth
-    float3 f3TotalRlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2ParticleDensity.x;
-    float3 f3TotalMieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb * f2ParticleDensity.y;
-        
-    // And total extinction for the current integration point:
-    float3 f3Extinction = exp( -(f3TotalRlghOpticalDepth + f3TotalMieOpticalDepth) );
-    return f3Extinction;
+    return GetExtinctionUnverified(f3StartPos, f3EndPos, f3EyeDir, f3EarthCentre);
 }
 
+float GetCosHorizonAnlge(float fHeight)
+{
+    // Due to numeric precision issues, fHeight might sometimes be slightly negative
+    fHeight = max(fHeight, 0);
+    return -sqrt(fHeight * (2*EARTH_RADIUS + fHeight) ) / (EARTH_RADIUS + fHeight);
+}
 
+float ZenithAngle2TexCoord(float fCosZenithAngle, float fHeight, in float fTexDim, float power, float fPrevTexCoord)
+{
+    fCosZenithAngle = fCosZenithAngle;
+    float fTexCoord;
+    float fCosHorzAngle = GetCosHorizonAnlge(fHeight);
+    // When performing look-ups into the scattering texture, it is very important that all the look-ups are consistent
+    // wrt to the horizon. This means that if the first look-up is above (below) horizon, then the second look-up
+    // should also be above (below) horizon. 
+    // We use previous texture coordinate, if it is provided, to find out if previous look-up was above or below
+    // horizon. If texture coordinate is negative, then this is the first look-up
+    bool bIsAboveHorizon = fPrevTexCoord >= 0.5;
+    bool bIsBelowHorizon = 0 <= fPrevTexCoord && fPrevTexCoord < 0.5;
+    if(  bIsAboveHorizon || 
+        !bIsBelowHorizon && (fCosZenithAngle > fCosHorzAngle) )
+    {
+        // Scale to [0,1]
+        fTexCoord = saturate( (fCosZenithAngle - fCosHorzAngle) / (1 - fCosHorzAngle) );
+        fTexCoord = pow(fTexCoord, power);
+        // Now remap texture coordinate to the upper half of the texture.
+        // To avoid filtering across discontinuity at 0.5, we must map
+        // the texture coordiante to [0.5 + 0.5/fTexDim, 1 - 0.5/fTexDim]
+        //
+        //      0.5   1.5               D/2+0.5        D-0.5  texture coordinate x dimension
+        //       |     |                   |            |
+        //    |  X  |  X  | .... |  X  ||  X  | .... |  X  |  
+        //       0     1          D/2-1   D/2          D-1    texel index
+        //
+        fTexCoord = 0.5f + 0.5f / fTexDim + fTexCoord * (fTexDim/2 - 1) / fTexDim;
+    }
+    else
+    {
+        fTexCoord = saturate( (fCosHorzAngle - fCosZenithAngle) / (fCosHorzAngle - (-1)) );
+        fTexCoord = pow(fTexCoord, power);
+        // Now remap texture coordinate to the lower half of the texture.
+        // To avoid filtering across discontinuity at 0.5, we must map
+        // the texture coordiante to [0.5, 0.5 - 0.5/fTexDim]
+        //
+        //      0.5   1.5        D/2-0.5             texture coordinate x dimension
+        //       |     |            |       
+        //    |  X  |  X  | .... |  X  ||  X  | .... 
+        //       0     1          D/2-1   D/2        texel index
+        //
+        fTexCoord = 0.5f / fTexDim + fTexCoord * (fTexDim/2 - 1) / fTexDim;
+    }    
 
+    return fTexCoord;
+}
 
+float TexCoord2ZenithAngle(float fTexCoord, float fHeight, in float fTexDim, float power)
+{
+    float fCosZenithAngle;
+
+    float fCosHorzAngle = GetCosHorizonAnlge(fHeight);
+    if( fTexCoord > 0.5 )
+    {
+        // Remap to [0,1] from the upper half of the texture [0.5 + 0.5/fTexDim, 1 - 0.5/fTexDim]
+        fTexCoord = saturate( (fTexCoord - (0.5f + 0.5f / fTexDim)) * fTexDim / (fTexDim/2 - 1) );
+        fTexCoord = pow(fTexCoord, 1/power);
+        // Assure that the ray does NOT hit Earth
+        fCosZenithAngle = max( (fCosHorzAngle + fTexCoord * (1 - fCosHorzAngle)), fCosHorzAngle + 1e-4);
+    }
+    else
+    {
+        // Remap to [0,1] from the lower half of the texture [0.5, 0.5 - 0.5/fTexDim]
+        fTexCoord = saturate((fTexCoord - 0.5f / fTexDim) * fTexDim / (fTexDim/2 - 1));
+        fTexCoord = pow(fTexCoord, 1/power);
+        // Assure that the ray DOES hit Earth
+        fCosZenithAngle = min( (fCosHorzAngle - fTexCoord * (fCosHorzAngle - (-1))), fCosHorzAngle - 1e-4);
+    }
+    return fCosZenithAngle;
+}
+
+static const float SafetyHeightMargin = 10.f;
+#define NON_LINEAR_PARAMETERIZATION 1
+static const float HeightPower = 0.5f;
+static const float ViewZenithPower = 0.2;
+static const float SunViewPower = 1.5f;
+
+void InsctrLUTCoords2WorldParams(in float4 f4UVWQ,
+                                 out float fHeight,
+                                 out float fCosViewZenithAngle,
+                                 out float fCosSunZenithAngle,
+                                 out float fCosSunViewAngle)
+{
+#if NON_LINEAR_PARAMETERIZATION
+    // Rescale to exactly 0,1 range
+    f4UVWQ.xzw = saturate((f4UVWQ* PRECOMPUTED_SCTR_LUT_DIM - 0.5) / (PRECOMPUTED_SCTR_LUT_DIM-1)).xzw;
+
+    f4UVWQ.x = pow( f4UVWQ.x, 1/HeightPower );
+    // Allowable height range is limited to [SafetyHeightMargin, AtmTopHeight - SafetyHeightMargin] to
+    // avoid numeric issues at the Earth surface and the top of the atmosphere
+    fHeight = f4UVWQ.x * (g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin) + SafetyHeightMargin;
+
+    fCosViewZenithAngle = TexCoord2ZenithAngle(f4UVWQ.y, fHeight, PRECOMPUTED_SCTR_LUT_DIM.y, ViewZenithPower);
+    
+    // Use Eric Bruneton's formula for cosine of the sun-zenith angle
+    fCosSunZenithAngle = tan((2.0 * f4UVWQ.z - 1.0 + 0.26) * 1.1) / tan(1.26 * 1.1);
+
+    f4UVWQ.w = sign(f4UVWQ.w - 0.5) * pow( abs((f4UVWQ.w - 0.5)*2), 1/SunViewPower)/2 + 0.5;
+    fCosSunViewAngle = cos(f4UVWQ.w*PI);
+#else
+    // Rescale to exactly 0,1 range
+    f4UVWQ = (f4UVWQ * PRECOMPUTED_SCTR_LUT_DIM - 0.5) / (PRECOMPUTED_SCTR_LUT_DIM-1);
+
+    // Allowable height range is limited to [SafetyHeightMargin, AtmTopHeight - SafetyHeightMargin] to
+    // avoid numeric issues at the Earth surface and the top of the atmosphere
+    fHeight = f4UVWQ.x * (g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin) + SafetyHeightMargin;
+
+    fCosViewZenithAngle = f4UVWQ.y * 2 - 1;
+    fCosSunZenithAngle  = f4UVWQ.z * 2 - 1;
+    fCosSunViewAngle    = f4UVWQ.w * 2 - 1;
+#endif
+
+    fCosViewZenithAngle = clamp(fCosViewZenithAngle, -1, +1);
+    fCosSunZenithAngle  = clamp(fCosSunZenithAngle,  -1, +1);
+    // Compute allowable range for the cosine of the sun view angle for the given
+    // view zenith and sun zenith angles
+    float D = sqrt( (1.0 - fCosViewZenithAngle * fCosViewZenithAngle) * (1.0 - fCosSunZenithAngle  * fCosSunZenithAngle) );
+    float2 f2MinMaxCosSunViewAngle = fCosViewZenithAngle*fCosSunZenithAngle + float2(-D, +D);
+    // Clamp to allowable range
+    fCosSunViewAngle    = clamp(fCosSunViewAngle, f2MinMaxCosSunViewAngle.x, f2MinMaxCosSunViewAngle.y);
+}
+
+float4 WorldParams2InsctrLUTCoords(float fHeight,
+                                   float fCosViewZenithAngle,
+                                   float fCosSunZenithAngle,
+                                   float fCosSunViewAngle,
+                                   in float4 f4RefUVWQ)
+{
+    float4 f4UVWQ;
+
+    // Limit allowable height range to [SafetyHeightMargin, AtmTopHeight - SafetyHeightMargin] to
+    // avoid numeric issues at the Earth surface and the top of the atmosphere
+    // (ray/Earth and ray/top of the atmosphere intersection tests are unstable when fHeight == 0 and
+    // fHeight == AtmTopHeight respectively)
+    fHeight = clamp(fHeight, SafetyHeightMargin, g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin);
+    f4UVWQ.x = saturate( (fHeight - SafetyHeightMargin) / (g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin) );
+
+#if NON_LINEAR_PARAMETERIZATION
+    f4UVWQ.x = pow(f4UVWQ.x, HeightPower);
+
+    f4UVWQ.y = ZenithAngle2TexCoord(fCosViewZenithAngle, fHeight, PRECOMPUTED_SCTR_LUT_DIM.y, ViewZenithPower, f4RefUVWQ.y);
+    
+    // Use Eric Bruneton's formula for cosine of the sun-zenith angle
+    f4UVWQ.z = (atan(max(fCosSunZenithAngle, -0.1975) * tan(1.26 * 1.1)) / 1.1 + (1.0 - 0.26)) * 0.5;
+
+    fCosSunViewAngle = clamp(fCosSunViewAngle, -1, +1);
+    f4UVWQ.w = acos(fCosSunViewAngle) / PI;
+    f4UVWQ.w = sign(f4UVWQ.w - 0.5) * pow( abs((f4UVWQ.w - 0.5)/0.5), SunViewPower)/2 + 0.5;
+    
+    f4UVWQ.xzw = ((f4UVWQ * (PRECOMPUTED_SCTR_LUT_DIM-1) + 0.5) / PRECOMPUTED_SCTR_LUT_DIM).xzw;
+#else
+    f4UVWQ.y = (fCosViewZenithAngle+1.f) / 2.f;
+    f4UVWQ.z = (fCosSunZenithAngle +1.f) / 2.f;
+    f4UVWQ.w = (fCosSunViewAngle   +1.f) / 2.f;
+
+    f4UVWQ = (f4UVWQ * (PRECOMPUTED_SCTR_LUT_DIM-1) + 0.5) / PRECOMPUTED_SCTR_LUT_DIM;
+#endif
+
+    return f4UVWQ;
+}
+
+float3 ComputeViewDir(in float fCosViewZenithAngle)
+{
+    return float3(sqrt(saturate(1 - fCosViewZenithAngle*fCosViewZenithAngle)), fCosViewZenithAngle, 0);
+}
+
+float3 ComputeLightDir(in float3 f3ViewDir, in float fCosSunZenithAngle, in float fCosSunViewAngle)
+{
+    float3 f3DirOnLight;
+    f3DirOnLight.x = f3ViewDir.x != 0 ? (fCosSunViewAngle - fCosSunZenithAngle * f3ViewDir.y) / f3ViewDir.x : 0;
+    f3DirOnLight.y = fCosSunZenithAngle;
+    f3DirOnLight.z = sqrt( saturate(1 - dot(f3DirOnLight.xy, f3DirOnLight.xy)) );
+    f3DirOnLight = normalize(f3DirOnLight);
+    return f3DirOnLight;
+}
+
+// This shader pre-computes the radiance of single scattering at a given point in given
+// direction.
+float3 PrecomputeSingleScatteringPS(SScreenSizeQuadVSOutput In) : SV_Target
+{
+    // Get attributes for the current point
+    float2 f2UV = ProjToUV(In.m_f2PosPS);
+    float fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle;
+    InsctrLUTCoords2WorldParams(float4(f2UV, g_MiscParams.f2WQ), fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle );
+    float3 f3EarthCentre =  - float3(0,1,0) * EARTH_RADIUS;
+    float3 f3RayStart = float3(0, fHeight, 0);
+    float3 f3ViewDir = ComputeViewDir(fCosViewZenithAngle);
+    float3 f3DirOnLight = ComputeLightDir(f3ViewDir, fCosSunZenithAngle, fCosSunViewAngle);
+  
+    // Intersect view ray with the top of the atmosphere and the Earth
+    float4 f4Isecs;
+    GetRaySphereIntersection2( f3RayStart, f3ViewDir, f3EarthCentre, 
+                               float2(EARTH_RADIUS, ATM_TOP_RADIUS), 
+                               f4Isecs);
+    float2 f2RayEarthIsecs  = f4Isecs.xy;
+    float2 f2RayAtmTopIsecs = f4Isecs.zw;
+
+    if(f2RayAtmTopIsecs.y <= 0)
+        return 0; // This is just a sanity check and should never happen
+                  // as the start point is always under the top of the 
+                  // atmosphere (look at InsctrLUTCoords2WorldParams())
+
+    // Set the ray length to the distance to the top of the atmosphere
+    float fRayLength = f2RayAtmTopIsecs.y;
+    // If ray hits Earth, limit the length by the distance to the surface
+    if(f2RayEarthIsecs.x > 0)
+        fRayLength = min(fRayLength, f2RayEarthIsecs.x);
+    
+    float3 f3RayEnd = f3RayStart + f3ViewDir * fRayLength;
+
+    // Integrate single-scattering
+    float3 f3Inscattering, f3Extinction;
+    IntegrateUnshadowedInscattering(f3RayStart, 
+                                    f3RayEnd,
+                                    f3ViewDir,
+                                    f3EarthCentre,
+                                    f3DirOnLight.xyz,
+                                    100,
+                                    f3Inscattering,
+                                    f3Extinction);
+
+    return f3Inscattering;
+}
+
+// This shader pre-computes the radiance of light scattered at a given point in given
+// direction. It multiplies the previous order in-scattered light with the phase function 
+// for each type of particles and integrates the result over the whole set of directions,
+// see eq. (7) in [Bruneton and Neyret 08].
+float3 ComputeSctrRadiancePS(SScreenSizeQuadVSOutput In) : SV_Target
+{
+    // Get attributes for the current point
+    float2 f2UV = ProjToUV(In.m_f2PosPS);
+    float fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle;
+    InsctrLUTCoords2WorldParams( float4(f2UV, g_MiscParams.f2WQ), fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle );
+    float3 f3EarthCentre =  - float3(0,1,0) * EARTH_RADIUS;
+    float3 f3RayStart = float3(0, fHeight, 0);
+    float3 f3ViewDir = ComputeViewDir(fCosViewZenithAngle);
+    float3 f3DirOnLight = ComputeLightDir(f3ViewDir, fCosSunZenithAngle, fCosSunViewAngle);
+    
+    // Compute particle density scale factor
+    float2 f2ParticleDensity = exp( -fHeight / PARTICLE_SCALE_HEIGHT );
+    
+    float3 f3SctrRadiance = 0;
+    // Go through a number of samples randomly distributed over the sphere
+    for(int iSample = 0; iSample < NUM_RANDOM_SPHERE_SAMPLES; ++iSample)
+    {
+        // Get random direction
+        float3 f3RandomDir = normalize( g_tex2DSphereRandomSampling.Load(int3(iSample,0,0)) );
+        // Get the previous order in-scattered light when looking in direction f3RandomDir (the light thus goes in direction -f3RandomDir)
+        float4 f4UVWQ = -1;
+        float3 f3PrevOrderSctr = LookUpPrecomputedScattering(f3RayStart, f3RandomDir, f3EarthCentre, f3DirOnLight.xyz, g_tex3DPreviousSctrOrder, f4UVWQ); 
+        
+        // Apply phase functions for each type of particles
+        // Note that total scattering coefficients are baked into the angular scattering coeffs
+        float3 f3DRlghInsctr = f2ParticleDensity.x * f3PrevOrderSctr;
+        float3 f3DMieInsctr  = f2ParticleDensity.y * f3PrevOrderSctr;
+        float fCosTheta = dot(f3ViewDir, f3RandomDir);
+        ApplyPhaseFunctions(f3DRlghInsctr, f3DMieInsctr, fCosTheta);
+
+        f3SctrRadiance += f3DRlghInsctr + f3DMieInsctr;
+    }
+    // Since we tested N random samples, each sample covered 4*Pi / N solid angle
+    // Note that our phase function is normalized to 1 over the sphere. For instance,
+    // uniform phase function would be p(theta) = 1 / (4*Pi).
+    // Notice that for uniform intensity I if we get N samples, we must obtain exactly I after
+    // numeric integration
+    return f3SctrRadiance * 4*PI / NUM_RANDOM_SPHERE_SAMPLES;
+}
+
+// This shader computes in-scattering order for a given point and direction. It performs integration of the 
+// light scattered at particular point along the ray, see eq. (11) in [Bruneton and Neyret 08].
+float3 ComputeScatteringOrderPS(SScreenSizeQuadVSOutput In) : SV_Target
+{
+    // Get attributes for the current point
+    float2 f2UV = ProjToUV(In.m_f2PosPS);
+    float fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle;
+    InsctrLUTCoords2WorldParams(float4(f2UV, g_MiscParams.f2WQ), fHeight, fCosViewZenithAngle, fCosSunZenithAngle, fCosSunViewAngle );
+    float3 f3EarthCentre =  - float3(0,1,0) * EARTH_RADIUS;
+    float3 f3RayStart = float3(0, fHeight, 0);
+    float3 f3ViewDir = ComputeViewDir(fCosViewZenithAngle);
+    float3 f3DirOnLight = ComputeLightDir(f3ViewDir, fCosSunZenithAngle, fCosSunViewAngle);
+    
+    // Intersect the ray with the atmosphere and Earth
+    float4 f4Isecs;
+    GetRaySphereIntersection2( f3RayStart, f3ViewDir, f3EarthCentre, 
+                               float2(EARTH_RADIUS, ATM_TOP_RADIUS), 
+                               f4Isecs);
+    float2 f2RayEarthIsecs  = f4Isecs.xy;
+    float2 f2RayAtmTopIsecs = f4Isecs.zw;
+
+    if(f2RayAtmTopIsecs.y <= 0)
+        return 0; // This is just a sanity check and should never happen
+                  // as the start point is always under the top of the 
+                  // atmosphere (look at InsctrLUTCoords2WorldParams())
+
+    float fRayLength = f2RayAtmTopIsecs.y;
+    if(f2RayEarthIsecs.x > 0)
+        fRayLength = min(fRayLength, f2RayEarthIsecs.x);
+    
+    float3 f3RayEnd = f3RayStart + f3ViewDir * fRayLength;
+
+    const float fNumSamples = 64;
+    float fStepLen = fRayLength / fNumSamples;
+
+    float4 f4UVWQ = -1;
+    float3 f3PrevSctrRadiance = LookUpPrecomputedScattering(f3RayStart, f3ViewDir, f3EarthCentre, f3DirOnLight.xyz, g_tex3DPointwiseSctrRadiance, f4UVWQ); 
+    float2 f2PrevParticleDensity = exp( -fHeight / PARTICLE_SCALE_HEIGHT );
+
+    float2 f2NetParticleDensityFromCam = 0;
+    float3 f3Inscattering = 0;
+
+    for(float fSample=1; fSample <= fNumSamples; ++fSample)
+    {
+        float3 f3Pos = lerp(f3RayStart, f3RayEnd, fSample/fNumSamples);
+
+        float fCurrHeight = length(f3Pos - f3EarthCentre) - EARTH_RADIUS;
+        float2 f2ParticleDensity = exp( -fCurrHeight / PARTICLE_SCALE_HEIGHT );
+
+        f2NetParticleDensityFromCam += (f2PrevParticleDensity + f2ParticleDensity) * (fStepLen / 2.f);
+        f2PrevParticleDensity = f2ParticleDensity;
+        
+        // Get optical depth
+        float3 f3RlghOpticalDepth = g_MediaParams.f4RayleighExtinctionCoeff.rgb * f2NetParticleDensityFromCam.x;
+        float3 f3MieOpticalDepth  = g_MediaParams.f4MieExtinctionCoeff.rgb      * f2NetParticleDensityFromCam.y;
+        
+        // Compute extinction from the camera for the current integration point:
+        float3 f3ExtinctionFromCam = exp( -(f3RlghOpticalDepth + f3MieOpticalDepth) );
+
+        // Get attenuated scattered light radiance in the current point
+        float4 f4UVWQ = -1;
+        float3 f3SctrRadiance = f3ExtinctionFromCam * LookUpPrecomputedScattering(f3Pos, f3ViewDir, f3EarthCentre, f3DirOnLight.xyz, g_tex3DPointwiseSctrRadiance, f4UVWQ); 
+        // Update in-scattering integral
+        f3Inscattering += (f3SctrRadiance +  f3PrevSctrRadiance) * (fStepLen/2.f);
+        f3PrevSctrRadiance = f3SctrRadiance;
+    }
+
+    return f3Inscattering;
+}
+
+float3 AddScatteringOrderPS(SScreenSizeQuadVSOutput In) : SV_Target
+{
+    // Accumulate in-scattering using alpha-blending
+    return g_tex3DPreviousSctrOrder.Load( uint4(In.m_f4Pos.xy, g_MiscParams.uiDepthSlice, 0) );
+}
+
+technique11 PrecomputeScatteringTech
+{
+    pass P0
+    {
+        SetBlendState( NoBlending, float4( 0.0f, 0.0f, 0.0f, 0.0f ), 0xFFFFFFFF );
+        SetRasterizerState( RS_SolidFill_NoCull );
+        SetDepthStencilState( DSS_NoDepthTest, 0 );
+
+        SetVertexShader( CompileShader(vs_5_0, GenerateScreenSizeQuadVS() ) );
+        SetGeometryShader( NULL );
+        SetPixelShader( CompileShader(ps_5_0, PrecomputeSingleScatteringPS() ) );
+    }
+
+    pass P1
+    {
+        SetBlendState( NoBlending, float4( 0.0f, 0.0f, 0.0f, 0.0f ), 0xFFFFFFFF );
+        SetRasterizerState( RS_SolidFill_NoCull );
+        SetDepthStencilState( DSS_NoDepthTest, 0 );
+
+        SetVertexShader( CompileShader(vs_5_0, GenerateScreenSizeQuadVS() ) );
+        SetGeometryShader( NULL );
+        SetPixelShader( CompileShader(ps_5_0, ComputeSctrRadiancePS() ) );
+    }
+
+    pass P2
+    {
+        SetBlendState( NoBlending, float4( 0.0f, 0.0f, 0.0f, 0.0f ), 0xFFFFFFFF );
+        SetRasterizerState( RS_SolidFill_NoCull );
+        SetDepthStencilState( DSS_NoDepthTest, 0 );
+
+        SetVertexShader( CompileShader(vs_5_0, GenerateScreenSizeQuadVS() ) );
+        SetGeometryShader( NULL );
+        SetPixelShader( CompileShader(ps_5_0, ComputeScatteringOrderPS() ) );
+    }
+}
+
+float3 PrecomputeAmbientSkyLightPS(SScreenSizeQuadVSOutput In) : SV_Target
+{
+    float fU = ProjToUV(In.m_f2PosPS).x;
+    float3 f3RayStart = float3(0,20,0);
+    float3 f3EarthCentre =  -float3(0,1,0) * EARTH_RADIUS;
+    float fCosZenithAngle = clamp(fU * 2 - 1, -1, +1);
+    float3 f3DirOnLight = float3(sqrt(saturate(1 - fCosZenithAngle*fCosZenithAngle)), fCosZenithAngle, 0);
+    float3 f3SkyLight = 0;
+    // Go through a number of random directions on the sphere
+    for(int iSample = 0; iSample < NUM_RANDOM_SPHERE_SAMPLES; ++iSample)
+    {
+        // Get random direction
+        float3 f3RandomDir = normalize( g_tex2DSphereRandomSampling.Load(int3(iSample,0,0)) );
+        // Reflect directions from the lower hemisphere
+        f3RandomDir.y = abs(f3RandomDir.y);
+        // Get multiple scattered light radiance when looking in direction f3RandomDir (the light thus goes in direction -f3RandomDir)
+        float4 f4UVWQ = -1;
+        float3 f3Sctr = LookUpPrecomputedScattering(f3RayStart, f3RandomDir, f3EarthCentre, f3DirOnLight.xyz, g_tex3DPreviousSctrOrder, f4UVWQ); 
+        // Accumulate ambient irradiance through the horizontal plane
+        f3SkyLight += f3Sctr * dot(f3RandomDir, float3(0,1,0));
+    }
+    // Each sample covers 2 * PI / NUM_RANDOM_SPHERE_SAMPLES solid angle (integration is performed over
+    // upper hemisphere)
+    return f3SkyLight * 2 * PI / NUM_RANDOM_SPHERE_SAMPLES;
+}
 
 struct SSunVSOutput
 {

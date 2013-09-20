@@ -137,6 +137,14 @@ HRESULT CLightSctrPostProcess :: OnCreateDevice(ID3D11Device* in_pd3dDevice,
     AdditiveBlendStateDesc.RenderTarget[0].SrcBlendAlpha= D3D11_BLEND_ONE;
     V_RETURN( in_pd3dDevice->CreateBlendState( &AdditiveBlendStateDesc, &m_pAdditiveBlendBS) );
 
+    D3D11_BLEND_DESC AlphaBlendStateDesc = AdditiveBlendStateDesc;
+    AlphaBlendStateDesc.RenderTarget[0].SrcBlend      = D3D11_BLEND_SRC_ALPHA;
+    AlphaBlendStateDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+    AlphaBlendStateDesc.RenderTarget[0].DestBlend      = D3D11_BLEND_INV_SRC_ALPHA;
+    AlphaBlendStateDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    V_RETURN( in_pd3dDevice->CreateBlendState( &AlphaBlendStateDesc, &m_pAlphaBlendBS) );
+    
+
     
 
     // Create samplers
@@ -170,6 +178,10 @@ HRESULT CLightSctrPostProcess :: OnCreateDevice(ID3D11Device* in_pd3dDevice,
         +FLT_MAX //FLOAT MaxLOD;
     };
     V_RETURN( in_pd3dDevice->CreateSamplerState( &SamLinearClampDesc, &m_psamLinearClamp) );
+
+    D3D11_SAMPLER_DESC SamPointClampDesc = SamLinearClampDesc;
+    SamPointClampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    V_RETURN( in_pd3dDevice->CreateSamplerState( &SamPointClampDesc, &m_psamPointClamp) );
 
     D3D11_SAMPLER_DESC SamComparisonDesc = 
     {
@@ -226,6 +238,8 @@ HRESULT CLightSctrPostProcess :: OnCreateDevice(ID3D11Device* in_pd3dDevice,
     V( GenerateScreenSizeQuadTech.CreateVertexShaderFromFile(m_strEffectPath, "GenerateScreenSizeQuadVS", NULL ) );
     m_pGenerateScreenSizeQuadVS = GenerateScreenSizeQuadTech.GetVS();
 
+    CreatePrecomputedOpticalDepthTexture(in_pd3dDevice, in_pd3dDeviceContext);
+
     return S_OK;
 }
 
@@ -257,13 +271,25 @@ void CLightSctrPostProcess :: OnDestroyDevice()
     m_ptex2DSliceUVDirAndOriginRTV.Release();
 
     m_ptex2DOccludedNetDensityToAtmTopSRV.Release();
-    m_ptex2DUnoccludedNetDensityToAtmTopSRV.Release();
     m_ptex2DOccludedNetDensityToAtmTopRTV.Release();
-    m_ptex2DUnoccludedNetDensityToAtmTopRTV.Release();
+    m_ptex3DSingleScatteringSRV.Release();
+    m_ptex3DHighOrderScatteringSRV.Release();
+    m_ptex3DMultipleScatteringSRV.Release();
+    
+    m_ptex2DLowResLuminanceSRV.Release();
+    m_ptex2DLowResLuminanceRTV.Release();
+    m_ptex2DAverageLuminanceRTV.Release();
+    m_ptex2DAverageLuminanceSRV.Release();
+
+    m_ptex2DAmbientSkyLightRTV.Release();
+    m_ptex2DAmbientSkyLightSRV.Release();
+
+    m_ptex2DSphereRandomSamplingSRV.Release();
 
     m_psamLinearClamp.Release();
     m_psamLinearBorder0.Release();
     m_psamComparison.Release();
+    m_psamPointClamp.Release();
 
     m_ReconstrCamSpaceZTech.Release();
     m_RendedSliceEndpointsTech.Release();
@@ -278,10 +304,16 @@ void CLightSctrPostProcess :: OnDestroyDevice()
     m_DoRayMarchTech[1].Release();
     m_InterpolateIrradianceTech.Release();
     m_UnwarpEpipolarSctrImgTech.Release();
-    m_FixInsctrAtDepthBreaksTech[0].Release();
-    m_FixInsctrAtDepthBreaksTech[1].Release();
+    m_UnwarpAndRenderLuminanceTech.Release();
+    m_UpdateAverageLuminanceTech.Release();
+    for(size_t i=0; i<_countof(m_FixInsctrAtDepthBreaksTech); ++i)
+        m_FixInsctrAtDepthBreaksTech[i].Release();
     m_RenderSampleLocationsTech.Release();
     m_RenderSunTech.Release();
+    m_PrecomputeSingleSctrTech.Release();
+    m_ComputeSctrRadianceTech.Release();
+    m_ComputeScatteringOrderTech.Release();
+    m_AddScatteringOrderTech.Release();
 
     m_pGenerateScreenSizeQuadVS.Release();
 
@@ -295,6 +327,7 @@ void CLightSctrPostProcess :: OnDestroyDevice()
 
     m_pDefaultBS.Release();
     m_pAdditiveBlendBS.Release();
+    m_pAlphaBlendBS.Release();
 
     m_pcbCameraAttribs.Release();
     //m_pcbLightAttribs.Release();
@@ -339,14 +372,17 @@ HRESULT CLightSctrPostProcess :: OnResizedSwapChain(ID3D11Device* pd3dDevice, UI
     V_RETURN( pd3dDevice->CreateRenderTargetView( ptex2DCamSpaceZ, NULL, &m_ptex2DCameraSpaceZRTV)  );
 
     m_RendedSliceEndpointsTech.Release();
+    m_RendedCoordTexTech.Release();
+    m_RenderSliceUVDirInSMTech.Release();
     m_RenderSampleLocationsTech.Release();
     m_UnwarpEpipolarSctrImgTech.Release();
+    m_UnwarpAndRenderLuminanceTech.Release();
     return S_OK;
 }
 
 static void UnbindResources(ID3D11DeviceContext *pDeviceCtx)
 {
-    ID3D11ShaderResourceView *pDummySRVs[8]={NULL};
+    ID3D11ShaderResourceView *pDummySRVs[12]={NULL};
     ID3D11UnorderedAccessView *pDummyUAVs[8]={NULL};
     pDeviceCtx->PSSetShaderResources(0, _countof(pDummySRVs), pDummySRVs);
     pDeviceCtx->VSSetShaderResources(0, _countof(pDummySRVs), pDummySRVs);
@@ -416,11 +452,22 @@ void CLightSctrPostProcess :: DefineMacros(class CD3DShaderMacroHelper &Macros)
     Macros.AddShaderMacro("USE_COMBINED_MIN_MAX_TEXTURE", m_bUseCombinedMinMaxTexture );
     Macros.AddShaderMacro("EXTINCTION_EVAL_MODE", m_PostProcessingAttribs.m_uiExtinctionEvalMode );
     Macros.AddShaderMacro("ENABLE_LIGHT_SHAFTS", m_PostProcessingAttribs.m_bEnableLightShafts);
+    Macros.AddShaderMacro("MULTIPLE_SCATTERING_MODE", m_PostProcessingAttribs.m_uiMultipleScatteringMode);
+    Macros.AddShaderMacro("SINGLE_SCATTERING_MODE", m_PostProcessingAttribs.m_uiSingleScatteringMode);
     
     {
         std::stringstream ss;
         ss<<"float2("<<m_uiBackBufferWidth<<","<<m_uiBackBufferHeight<<")";
         Macros.AddShaderMacro("SCREEN_RESLOUTION", ss.str());
+    }
+
+    {
+        std::stringstream ss;
+        ss<<"float4("<<sm_iPrecomputedSctrUDim<<","
+                     <<sm_iPrecomputedSctrVDim<<","
+                     <<sm_iPrecomputedSctrWDim<<","
+                     <<sm_iPrecomputedSctrQDim<<")";
+        Macros.AddShaderMacro("PRECOMPUTED_SCTR_LUT_DIM", ss.str());
     }
 
     Macros.AddShaderMacro("EARTH_RADIUS",   m_MediaParams.fEarthRadius);
@@ -441,9 +488,9 @@ HRESULT CLightSctrPostProcess::CreatePrecomputedOpticalDepthTexture(ID3D11Device
 
     CRenderTechnique PrecomputeNetDensityToAtmTopTech;
     PrecomputeNetDensityToAtmTopTech.SetDeviceAndContext(in_pd3dDevice, in_pd3dDeviceContext);
-    CD3DShaderMacroHelper Macroes;
-    Macroes.Finalize();
-    PrecomputeNetDensityToAtmTopTech.CreatePixelShaderFromFile( m_strEffectPath, "PrecomputeNetDensityToAtmTopTechPS", Macroes );
+    CD3DShaderMacroHelper Macros;
+    Macros.Finalize();
+    PrecomputeNetDensityToAtmTopTech.CreatePixelShaderFromFile( m_strEffectPath, "PrecomputeNetDensityToAtmTopPS", Macros );
     PrecomputeNetDensityToAtmTopTech.SetVS( m_pGenerateScreenSizeQuadVS );
     PrecomputeNetDensityToAtmTopTech.SetDS( m_pDisableDepthTestDS, 0 );
     PrecomputeNetDensityToAtmTopTech.SetRS( m_pSolidFillNoCullRS );
@@ -464,25 +511,309 @@ HRESULT CLightSctrPostProcess::CreatePrecomputedOpticalDepthTexture(ID3D11Device
     };
 
     m_ptex2DOccludedNetDensityToAtmTopSRV.Release();
-    m_ptex2DUnoccludedNetDensityToAtmTopSRV.Release();
     m_ptex2DOccludedNetDensityToAtmTopRTV.Release();
-    m_ptex2DUnoccludedNetDensityToAtmTopRTV.Release();
 
-    CComPtr<ID3D11Texture2D> ptex2DOccludedNetDensityToAtmTop, ptex2DUnoccludedNetDensityToAtmTop;
+    CComPtr<ID3D11Texture2D> ptex2DOccludedNetDensityToAtmTop;
     V_RETURN( in_pd3dDevice->CreateTexture2D( &NetDensityToAtmTopTexDesc, NULL, &ptex2DOccludedNetDensityToAtmTop) );
     V_RETURN( in_pd3dDevice->CreateShaderResourceView( ptex2DOccludedNetDensityToAtmTop, NULL, &m_ptex2DOccludedNetDensityToAtmTopSRV)  );
     V_RETURN( in_pd3dDevice->CreateRenderTargetView( ptex2DOccludedNetDensityToAtmTop, NULL, &m_ptex2DOccludedNetDensityToAtmTopRTV)  );
 
-    V_RETURN( in_pd3dDevice->CreateTexture2D( &NetDensityToAtmTopTexDesc, NULL, &ptex2DUnoccludedNetDensityToAtmTop) );
-    V_RETURN( in_pd3dDevice->CreateShaderResourceView( ptex2DUnoccludedNetDensityToAtmTop, NULL, &m_ptex2DUnoccludedNetDensityToAtmTopSRV)  );
-    V_RETURN( in_pd3dDevice->CreateRenderTargetView( ptex2DUnoccludedNetDensityToAtmTop, NULL, &m_ptex2DUnoccludedNetDensityToAtmTopRTV)  );
-   
-    ID3D11RenderTargetView *pRTVs[] = { m_ptex2DOccludedNetDensityToAtmTopRTV, m_ptex2DUnoccludedNetDensityToAtmTopRTV };
+    ID3D11RenderTargetView *pRTVs[] = { m_ptex2DOccludedNetDensityToAtmTopRTV };
     in_pd3dDeviceContext->OMSetRenderTargets(_countof(pRTVs), pRTVs, NULL);
+
+    ID3D11Buffer *pCBs[] = {m_pcbMediaAttribs};
+    in_pd3dDeviceContext->PSSetConstantBuffers(1, _countof(pCBs), pCBs);
 
     RenderQuad(in_pd3dDeviceContext, PrecomputeNetDensityToAtmTopTech);
     
     in_pd3dDeviceContext->OMSetRenderTargets(0, NULL, NULL);
+
+    return S_OK;
+}
+
+void CLightSctrPostProcess :: CreateRandomSphereSamplingTexture(ID3D11Device *pDevice)
+{
+    D3D11_TEXTURE2D_DESC RandomSphereSamplingTexDesc = 
+    {
+        sm_iNumRandomSamplesOnSphere,   //UINT Width;
+        1,                              //UINT Height;
+        1,                              //UINT MipLevels;
+        1,                              //UINT ArraySize;
+        DXGI_FORMAT_R32G32B32A32_FLOAT, //DXGI_FORMAT Format;
+        {1,0},                          //DXGI_SAMPLE_DESC SampleDesc;
+        D3D11_USAGE_IMMUTABLE,          //D3D11_USAGE Usage;
+        D3D11_BIND_SHADER_RESOURCE,     //UINT BindFlags;
+        0,                              //UINT CPUAccessFlags;
+        0,                              //UINT MiscFlags;
+    };
+    std::vector<D3DXVECTOR4> SphereSampling(sm_iNumRandomSamplesOnSphere);
+    for(int iSample = 0; iSample < sm_iNumRandomSamplesOnSphere; ++iSample)
+    {
+        D3DXVECTOR4 &f4Sample = SphereSampling[iSample];
+        f4Sample.z = ((float)rand()/(float)RAND_MAX) * 2.f - 1.f;
+        float t = ((float)rand()/(float)RAND_MAX) * 2.f * PI;
+        float r = sqrt( max(1 - f4Sample.z*f4Sample.z, 0.f) );
+        f4Sample.x = r * cos(t);
+        f4Sample.y = r * sin(t);
+        f4Sample.w = 0;
+    }
+    D3D11_SUBRESOURCE_DATA InitData = 
+    {
+        &SphereSampling[0],
+        sm_iNumRandomSamplesOnSphere*sizeof(D3DXVECTOR4), // UINT SysMemPitch
+        0  // UINT SysMemSlicePitch
+    };
+    HRESULT hr;
+    CComPtr<ID3D11Texture2D> ptex2DSphereRandomSampling;
+    V( pDevice->CreateTexture2D( &RandomSphereSamplingTexDesc, &InitData, &ptex2DSphereRandomSampling) );
+    V( pDevice->CreateShaderResourceView( ptex2DSphereRandomSampling, NULL, &m_ptex2DSphereRandomSamplingSRV) );
+}
+
+HRESULT CLightSctrPostProcess :: CreatePrecomputedScatteringLUT(ID3D11Device *pDevice, ID3D11DeviceContext *pContext)
+{
+    HRESULT hr;
+
+    if( !m_PrecomputeSingleSctrTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.Finalize();
+        m_PrecomputeSingleSctrTech.SetDeviceAndContext(pDevice, pContext);
+        m_PrecomputeSingleSctrTech.CreatePixelShaderFromFile( m_strEffectPath, "PrecomputeSingleScatteringPS", Macros );
+        m_PrecomputeSingleSctrTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        m_PrecomputeSingleSctrTech.SetDS( m_pDisableDepthTestDS );
+        m_PrecomputeSingleSctrTech.SetRS( m_pSolidFillNoCullRS );
+        m_PrecomputeSingleSctrTech.SetBS( m_pDefaultBS );
+    }
+    
+    if( !m_ComputeSctrRadianceTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.AddShaderMacro( "NUM_RANDOM_SPHERE_SAMPLES", sm_iNumRandomSamplesOnSphere );
+        Macros.Finalize();
+        m_ComputeSctrRadianceTech.SetDeviceAndContext(pDevice, pContext);
+        m_ComputeSctrRadianceTech.CreatePixelShaderFromFile( m_strEffectPath, "ComputeSctrRadiancePS", Macros );
+        m_ComputeSctrRadianceTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        m_ComputeSctrRadianceTech.SetDS( m_pDisableDepthTestDS );
+        m_ComputeSctrRadianceTech.SetRS( m_pSolidFillNoCullRS );
+        m_ComputeSctrRadianceTech.SetBS( m_pDefaultBS );
+    }
+    
+    if( !m_ComputeScatteringOrderTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.Finalize();
+        m_ComputeScatteringOrderTech.SetDeviceAndContext(pDevice, pContext);
+        m_ComputeScatteringOrderTech.CreatePixelShaderFromFile( m_strEffectPath, "ComputeScatteringOrderPS", Macros );
+        m_ComputeScatteringOrderTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        m_ComputeScatteringOrderTech.SetDS( m_pDisableDepthTestDS );
+        m_ComputeScatteringOrderTech.SetRS( m_pSolidFillNoCullRS );
+        m_ComputeScatteringOrderTech.SetBS( m_pDefaultBS );
+    }
+
+    if( !m_AddScatteringOrderTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.Finalize();
+        m_AddScatteringOrderTech.SetDeviceAndContext(pDevice, pContext);
+        m_AddScatteringOrderTech.CreatePixelShaderFromFile( m_strEffectPath, "AddScatteringOrderPS", Macros );
+        m_AddScatteringOrderTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        m_AddScatteringOrderTech.SetDS( m_pDisableDepthTestDS );
+        m_AddScatteringOrderTech.SetRS( m_pSolidFillNoCullRS );
+        m_AddScatteringOrderTech.SetBS( m_pAdditiveBlendBS );
+    }
+        
+
+    if( !m_ptex2DSphereRandomSamplingSRV )
+        CreateRandomSphereSamplingTexture(pDevice);
+
+    m_ptex3DSingleScatteringSRV.Release();
+    m_ptex3DHighOrderScatteringSRV.Release();
+    m_ptex3DMultipleScatteringSRV.Release();
+
+    D3D11_TEXTURE3D_DESC PrecomputedSctrTexDesc = 
+    {
+        sm_iPrecomputedSctrUDim, //UINT Width;
+        sm_iPrecomputedSctrVDim, //UINT Height;
+        sm_iPrecomputedSctrWDim * sm_iPrecomputedSctrQDim, //UINT Depth;
+        1, //UINT MipLevels;
+        DXGI_FORMAT_R16G16B16A16_FLOAT,//DXGI_FORMAT Format;
+        D3D11_USAGE_DEFAULT, //D3D11_USAGE Usage;
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,//UINT BindFlags;
+        0,//UINT CPUAccessFlags;
+        0//UINT MiscFlags;
+    };
+
+    CComPtr<ID3D11Texture3D> ptex3DSingleSctr, ptex3DHighOrderSctr, ptex3DMultipleSctr;
+    V_RETURN(pDevice->CreateTexture3D(&PrecomputedSctrTexDesc, NULL, &ptex3DSingleSctr));
+    V_RETURN(pDevice->CreateShaderResourceView(ptex3DSingleSctr, NULL, &m_ptex3DSingleScatteringSRV));
+    V_RETURN(pDevice->CreateTexture3D(&PrecomputedSctrTexDesc, NULL, &ptex3DHighOrderSctr));
+    V_RETURN(pDevice->CreateShaderResourceView(ptex3DHighOrderSctr, NULL, &m_ptex3DHighOrderScatteringSRV));
+    V_RETURN(pDevice->CreateTexture3D(&PrecomputedSctrTexDesc, NULL, &ptex3DMultipleSctr));
+    V_RETURN(pDevice->CreateShaderResourceView(ptex3DMultipleSctr, NULL, &m_ptex3DMultipleScatteringSRV));
+    std::vector< CComPtr<ID3D11RenderTargetView> > ptex3DHighOrderSctrRTVs(PrecomputedSctrTexDesc.Depth);
+    std::vector< CComPtr<ID3D11RenderTargetView> > ptex3DMultipleSctrRTVs(PrecomputedSctrTexDesc.Depth);
+
+    // Precompute single scattering
+    for(UINT uiDepthSlice = 0; uiDepthSlice < PrecomputedSctrTexDesc.Depth; ++uiDepthSlice)
+    {
+        D3D11_RENDER_TARGET_VIEW_DESC CurrSliceRTVDesc;
+        CurrSliceRTVDesc.Format = PrecomputedSctrTexDesc.Format;
+        CurrSliceRTVDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE3D;
+        CurrSliceRTVDesc.Texture3D.MipSlice = 0;
+        CurrSliceRTVDesc.Texture3D.FirstWSlice = uiDepthSlice;
+        CurrSliceRTVDesc.Texture3D.WSize = 1;
+
+        CComPtr<ID3D11RenderTargetView> ptex3DCurrDepthSliceRTV;
+        V_RETURN(pDevice->CreateRenderTargetView(ptex3DSingleSctr, &CurrSliceRTVDesc, &ptex3DCurrDepthSliceRTV));
+        
+        V_RETURN(pDevice->CreateRenderTargetView(ptex3DHighOrderSctr, &CurrSliceRTVDesc, &ptex3DHighOrderSctrRTVs[uiDepthSlice]));
+        float Zero[] = {0.f, 0.f, 0.f, 0.f};
+        pContext->ClearRenderTargetView(ptex3DHighOrderSctrRTVs[uiDepthSlice].p, Zero);
+
+        V_RETURN(pDevice->CreateRenderTargetView(ptex3DMultipleSctr, &CurrSliceRTVDesc, &ptex3DMultipleSctrRTVs[uiDepthSlice]));
+
+        pContext->OMSetRenderTargets(1, &ptex3DCurrDepthSliceRTV.p, NULL);
+
+        ID3D11ShaderResourceView *pSRVs[] = 
+        {
+            m_ptex2DOccludedNetDensityToAtmTopSRV  // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
+        };
+        pContext->PSSetShaderResources(5, _countof(pSRVs), pSRVs);
+
+        // Set sun zenith and sun view angles
+        SMiscDynamicParams MiscDynamicParams = {NULL};
+        UINT uiW = uiDepthSlice % sm_iPrecomputedSctrWDim;
+        UINT uiQ = uiDepthSlice / sm_iPrecomputedSctrWDim;
+        MiscDynamicParams.f2WQ.x = ((float)uiW + 0.5f) / (float)sm_iPrecomputedSctrWDim;
+        assert(0 < MiscDynamicParams.f2WQ.x && MiscDynamicParams.f2WQ.x < 1);
+        MiscDynamicParams.f2WQ.y = ((float)uiQ + 0.5f) / (float)sm_iPrecomputedSctrQDim;
+        assert(0 < MiscDynamicParams.f2WQ.y && MiscDynamicParams.f2WQ.y < 1);
+        UpdateConstantBuffer(pContext, m_pcbMiscParams, &MiscDynamicParams, sizeof(MiscDynamicParams));
+        //cbuffer cbMiscDynamicParams : register( b4 )
+        pContext->PSSetConstantBuffers(4, 1, &m_pcbMiscParams.p);
+
+        RenderQuad( pContext, 
+                    m_PrecomputeSingleSctrTech,
+                    PrecomputedSctrTexDesc.Width, PrecomputedSctrTexDesc.Height );
+    }
+
+    // Precompute multiple scattering
+    // We need higher precision to store intermediate data
+    PrecomputedSctrTexDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    CComPtr<ID3D11Texture3D> ptex3DSctrRadiance, ptex3DInsctrOrder;
+    CComPtr<ID3D11ShaderResourceView> ptex3DSctrRadianceSRV, ptex3DInsctrOrderSRV;
+    V_RETURN(pDevice->CreateTexture3D(&PrecomputedSctrTexDesc, NULL, &ptex3DSctrRadiance));
+    V_RETURN(pDevice->CreateTexture3D(&PrecomputedSctrTexDesc, NULL, &ptex3DInsctrOrder));
+    V_RETURN(pDevice->CreateShaderResourceView(ptex3DSctrRadiance, NULL, &ptex3DSctrRadianceSRV));
+    V_RETURN(pDevice->CreateShaderResourceView(ptex3DInsctrOrder, NULL, &ptex3DInsctrOrderSRV));
+
+    std::vector< CComPtr<ID3D11RenderTargetView> > ptex3DSctrRadianceRTVs(PrecomputedSctrTexDesc.Depth), ptex3DInsctrOrderRTVs(PrecomputedSctrTexDesc.Depth);
+    for(UINT uiDepthSlice = 0; uiDepthSlice < PrecomputedSctrTexDesc.Depth; ++uiDepthSlice)
+    {
+        D3D11_RENDER_TARGET_VIEW_DESC CurrSliceRTVDesc;
+        CurrSliceRTVDesc.Format = PrecomputedSctrTexDesc.Format;
+        CurrSliceRTVDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE3D;
+        CurrSliceRTVDesc.Texture3D.MipSlice = 0;
+        CurrSliceRTVDesc.Texture3D.FirstWSlice = uiDepthSlice;
+        CurrSliceRTVDesc.Texture3D.WSize = 1;
+
+        V_RETURN(pDevice->CreateRenderTargetView(ptex3DSctrRadiance, &CurrSliceRTVDesc, &ptex3DSctrRadianceRTVs[uiDepthSlice]));
+        V_RETURN(pDevice->CreateRenderTargetView(ptex3DInsctrOrder, &CurrSliceRTVDesc, &ptex3DInsctrOrderRTVs[uiDepthSlice]));
+    }
+
+    const int iNumScatteringOrders = 4;
+    for(int iSctrOrder = 1; iSctrOrder < iNumScatteringOrders; ++iSctrOrder)
+    {
+        for(int iPass = 0; iPass < 3; ++iPass)
+        {
+            pContext->OMSetRenderTargets(0, NULL, NULL);
+            // Pass 0: compute differential in-scattering
+            // Pass 1: integrate differential in-scattering
+            // Pass 2: accumulate total multiple scattering
+
+            ID3D11ShaderResourceView *pSRVs[2] = {nullptr};
+            
+            CRenderTechnique *pRenderTech = nullptr;
+            std::vector< CComPtr<ID3D11RenderTargetView> > *pRTVs;
+            switch(iPass)
+            {
+                case 0:
+                    // Pre-compute the radiance of light scattered at a given point in given direction.
+                    pRenderTech = &m_ComputeSctrRadianceTech; 
+                    pRTVs = &ptex3DSctrRadianceRTVs;
+                    pSRVs[0] = (iSctrOrder == 1) ? m_ptex3DSingleScatteringSRV : ptex3DInsctrOrderSRV;
+                    pSRVs[1] = m_ptex2DSphereRandomSamplingSRV;
+                    break;
+
+                case 1:
+                    // Compute in-scattering order for a given point and direction
+                    pRenderTech = &m_ComputeScatteringOrderTech; 
+                    pRTVs = &ptex3DInsctrOrderRTVs;
+                    pSRVs[0] = ptex3DSctrRadianceSRV;
+                    break;
+
+                case 2:
+                    // Accumulate in-scattering
+                    pRenderTech = &m_AddScatteringOrderTech; 
+                    pRTVs = &ptex3DHighOrderSctrRTVs;
+                    pSRVs[0] = ptex3DInsctrOrderSRV;
+                    break;
+            }
+            
+            for(UINT uiDepthSlice = 0; uiDepthSlice < PrecomputedSctrTexDesc.Depth; ++uiDepthSlice)
+            {
+                pContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
+
+                // Set sun zenith and sun view angles
+                SMiscDynamicParams MiscDynamicParams = {NULL};
+                MiscDynamicParams.uiDepthSlice = uiDepthSlice;
+                UINT uiW = uiDepthSlice % sm_iPrecomputedSctrWDim;
+                UINT uiQ = uiDepthSlice / sm_iPrecomputedSctrWDim;
+                MiscDynamicParams.f2WQ.x = ((float)uiW + 0.5f) / (float)sm_iPrecomputedSctrWDim;
+                assert(0 < MiscDynamicParams.f2WQ.x && MiscDynamicParams.f2WQ.x < 1);
+                MiscDynamicParams.f2WQ.y = ((float)uiQ + 0.5f) / (float)sm_iPrecomputedSctrQDim;
+                assert(0 < MiscDynamicParams.f2WQ.y && MiscDynamicParams.f2WQ.y < 1);
+                UpdateConstantBuffer(pContext, m_pcbMiscParams, &MiscDynamicParams, sizeof(MiscDynamicParams));
+                //cbuffer cbMiscDynamicParams : register( b4 )
+                pContext->PSSetConstantBuffers(4, 1, &m_pcbMiscParams.p);
+
+                auto *pRTV = (ID3D11RenderTargetView*)(*pRTVs)[uiDepthSlice];
+                pContext->OMSetRenderTargets(1, &pRTV, NULL);
+                
+                RenderQuad( pContext, 
+                            *pRenderTech,
+                            PrecomputedSctrTexDesc.Width, PrecomputedSctrTexDesc.Height );
+            }
+        }
+    }
+    pContext->OMSetRenderTargets(0, NULL, NULL);
+
+    // Combine single scattering and higher order scattering into single texture
+    pContext->CopyResource(ptex3DMultipleSctr, ptex3DSingleSctr);
+    for(UINT uiDepthSlice = 0; uiDepthSlice < PrecomputedSctrTexDesc.Depth; ++uiDepthSlice)
+    {
+        ID3D11ShaderResourceView *pSRVs[1] = {m_ptex3DHighOrderScatteringSRV};
+        pContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
+
+        SMiscDynamicParams MiscDynamicParams = {NULL};
+        MiscDynamicParams.uiDepthSlice = uiDepthSlice;
+        UpdateConstantBuffer(pContext, m_pcbMiscParams, &MiscDynamicParams, sizeof(MiscDynamicParams));
+        //cbuffer cbMiscDynamicParams : register( b4 )
+        pContext->PSSetConstantBuffers(4, 1, &m_pcbMiscParams.p);
+
+        auto *pRTV = (ID3D11RenderTargetView*)ptex3DMultipleSctrRTVs[uiDepthSlice];
+        pContext->OMSetRenderTargets(1, &pRTV, NULL);
+                
+        RenderQuad( pContext, 
+                    m_AddScatteringOrderTech,
+                    PrecomputedSctrTexDesc.Width, PrecomputedSctrTexDesc.Height );
+    }
+
+    pContext->OMSetRenderTargets(0, NULL, NULL);
 
     return S_OK;
 }
@@ -631,7 +962,10 @@ void CLightSctrPostProcess :: RenderCoarseUnshadowedInctr(SFrameAttribs &FrameAt
         nullptr,                       // t3
         nullptr,                       // t4
         m_ptex2DOccludedNetDensityToAtmTopSRV,  // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
-        m_ptex2DUnoccludedNetDensityToAtmTopSRV // Texture2D<float2> g_tex2DUnoccludedNetDensityToAtmTop : register( t6 );
+        nullptr,                             // t6 
+        m_ptex3DSingleScatteringSRV,         // Texture3D<float3> g_tex3DSingleSctrLUT      : register( t7 );
+        m_ptex3DHighOrderScatteringSRV,      // Texture3D<float3> g_tex3DHighOrderSctrLUT   : register( t8 );
+        m_ptex3DMultipleScatteringSRV        // Texture3D<float3> g_tex3DMultipleSctrLUT    : register( t9 );
     };
     FrameAttribs.pd3dDeviceContext->PSSetShaderResources(1, _countof(pSRVs), pSRVs);
 
@@ -852,8 +1186,7 @@ void CLightSctrPostProcess :: Build1DMinMaxMipMap(SFrameAttribs &FrameAttribs,
                 FrameAttribs.ptex2DShadowMapSRV, // Texture2D<float2> g_tex2DLightSpaceDepthMap    : register( t3 );
                 nullptr,                         // t4
                 nullptr,                         // t5
-                nullptr,                         // t6
-                m_ptex2DSliceUVDirAndOriginSRV   // Texture2D<float4> g_tex2DSliceUVDirAndOrigin   : register( t7 );
+                m_ptex2DSliceUVDirAndOriginSRV   // Texture2D<float4> g_tex2DSliceUVDirAndOrigin   : register( t6 );
             };
             FrameAttribs.pd3dDeviceContext->PSSetShaderResources( 3, _countof(pSRVs), pSRVs );
         }
@@ -934,9 +1267,11 @@ void CLightSctrPostProcess :: DoRayMarching(SFrameAttribs &FrameAttribs,
         m_ptex2DEpipolarCamSpaceZSRV,       //Texture2D<float> g_tex2DEpipolarCamSpaceZ        : register( t2 );
         FrameAttribs.ptex2DShadowMapSRV,    // Texture2D<float>  g_tex2DLightSpaceDepthMap     : register( t3 );
         m_ptex2DMinMaxShadowMapSRV[0],      // Texture2D<float2> g_tex2DMinMaxLightSpaceDepth  : register( t4 );
-        m_ptex2DOccludedNetDensityToAtmTopSRV,  // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
-        m_ptex2DUnoccludedNetDensityToAtmTopSRV, // Texture2D<float2> g_tex2DUnoccludedNetDensityToAtmTop : register( t6 );
-        m_ptex2DSliceUVDirAndOriginSRV      // Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t7 );
+        m_ptex2DOccludedNetDensityToAtmTopSRV, // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
+        m_ptex2DSliceUVDirAndOriginSRV,      // Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t6 );
+        m_ptex3DSingleScatteringSRV,         // Texture3D<float3> g_tex3DSingleSctrLUT          : register( t7 );
+        m_ptex3DHighOrderScatteringSRV,      // Texture3D<float3> g_tex3DHighOrderSctrLUT       : register( t8 );
+        m_ptex3DMultipleScatteringSRV        // Texture3D<float3> g_tex3DMultipleSctrLUT        : register( t9 );
     };
     FrameAttribs.pd3dDeviceContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
     
@@ -999,12 +1334,52 @@ void CLightSctrPostProcess :: InterpolateInsctrIrradiance(SFrameAttribs &FrameAt
     FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(0, NULL, NULL);
 }
 
-void CLightSctrPostProcess :: UnwarpEpipolarScattering(SFrameAttribs &FrameAttribs)
+void CLightSctrPostProcess :: CreateLowResLuminanceTexture(ID3D11Device *pDevice)
+{
+    D3D11_TEXTURE2D_DESC LowResLuminanceTexDesc = 
+    {
+        1 << (sm_iLowResLuminanceMips-1),   //UINT Width;
+        1 << (sm_iLowResLuminanceMips-1),   //UINT Height;
+        sm_iLowResLuminanceMips,            //UINT MipLevels;
+        1,                                  //UINT ArraySize;
+        DXGI_FORMAT_R16_FLOAT,              //DXGI_FORMAT Format;
+        {1,0},                              //DXGI_SAMPLE_DESC SampleDesc;
+        D3D11_USAGE_DEFAULT,                //D3D11_USAGE Usage;
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,           //UINT BindFlags;
+        0,                                  //UINT CPUAccessFlags;
+        D3D11_RESOURCE_MISC_GENERATE_MIPS                                  //UINT MiscFlags;
+    };
+
+    CComPtr<ID3D11Texture2D> ptex2DLowResLuminance;
+    // Create 2-D texture, shader resource and target view buffers on the device
+    HRESULT hr;
+    V( pDevice->CreateTexture2D( &LowResLuminanceTexDesc, NULL, &ptex2DLowResLuminance) );
+    V( pDevice->CreateShaderResourceView( ptex2DLowResLuminance, NULL, &m_ptex2DLowResLuminanceSRV) );
+    V( pDevice->CreateRenderTargetView( ptex2DLowResLuminance, NULL, &m_ptex2DLowResLuminanceRTV) );
+
+    // Create 2-D texture, shader resource and target view buffers on the device
+    LowResLuminanceTexDesc.Width = 1;
+    LowResLuminanceTexDesc.Height = 1;
+    LowResLuminanceTexDesc.MipLevels = 1;
+    LowResLuminanceTexDesc.MiscFlags = 0;
+    int Zero = 0;
+    D3D11_SUBRESOURCE_DATA InitData = {&Zero, 2, 0};
+    CComPtr<ID3D11Texture2D> ptex2DAverageLuminance;
+    V( pDevice->CreateTexture2D( &LowResLuminanceTexDesc, &InitData, &ptex2DAverageLuminance) );
+    V( pDevice->CreateShaderResourceView( ptex2DAverageLuminance, NULL, &m_ptex2DAverageLuminanceSRV) );
+    V( pDevice->CreateRenderTargetView( ptex2DAverageLuminance, NULL, &m_ptex2DAverageLuminanceRTV) );
+}
+
+void CLightSctrPostProcess :: UnwarpEpipolarScattering(SFrameAttribs &FrameAttribs, bool bRenderLuminance)
 {
     if( !m_UnwarpEpipolarSctrImgTech.IsValid()  )
     {
         CD3DShaderMacroHelper Macros;
         DefineMacros(Macros);
+        Macros.AddShaderMacro("PERFORM_TONE_MAPPING", true);
+        Macros.AddShaderMacro("AUTO_EXPOSURE", m_PostProcessingAttribs.m_bAutoExposure);
+        Macros.AddShaderMacro("TONE_MAPPING_MODE", m_PostProcessingAttribs.m_uiToneMappingMode);
+        Macros.AddShaderMacro("CORRECT_INSCATTERING_AT_DEPTH_BREAKS", m_PostProcessingAttribs.m_bCorrectScatteringAtDepthBreaks);
         Macros.Finalize();
         
         m_UnwarpEpipolarSctrImgTech.SetDeviceAndContext(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
@@ -1015,6 +1390,25 @@ void CLightSctrPostProcess :: UnwarpEpipolarScattering(SFrameAttribs &FrameAttri
         m_UnwarpEpipolarSctrImgTech.SetBS( m_pDefaultBS );
     }
 
+    if( !m_UnwarpAndRenderLuminanceTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.AddShaderMacro("PERFORM_TONE_MAPPING", false);
+        Macros.AddShaderMacro("CORRECT_INSCATTERING_AT_DEPTH_BREAKS", false);
+        Macros.Finalize();
+        
+        m_UnwarpAndRenderLuminanceTech.SetDeviceAndContext(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
+        m_UnwarpAndRenderLuminanceTech.CreatePixelShaderFromFile( m_strEffectPath, "ApplyInscatteredRadiancePS", Macros );
+        m_UnwarpAndRenderLuminanceTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        // Do not use stencil
+        m_UnwarpAndRenderLuminanceTech.SetDS( m_pDisableDepthTestDS );
+        m_UnwarpAndRenderLuminanceTech.SetRS( m_pSolidFillNoCullRS );
+        m_UnwarpAndRenderLuminanceTech.SetBS( m_pDefaultBS );
+    }
+
+    CRenderTechnique &Tech = bRenderLuminance ? m_UnwarpAndRenderLuminanceTech : m_UnwarpEpipolarSctrImgTech;
+
     ID3D11ShaderResourceView *pSRVs[] = 
     {
         m_ptex2DCameraSpaceZSRV,                // Texture2D<float>  g_tex2DCamSpaceZ              : register( t0 );
@@ -1023,33 +1417,76 @@ void CLightSctrPostProcess :: UnwarpEpipolarScattering(SFrameAttribs &FrameAttri
         m_ptex2DEpipolarInscatteringSRV,        // Texture2D<float3> g_tex2DScatteredColor         : register( t3 );
         m_ptex2DSliceEndpointsSRV,              // Texture2D<float4> g_tex2DSliceEndPoints         : register( t4 );
         m_ptex2DOccludedNetDensityToAtmTopSRV,  // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
-        m_ptex2DUnoccludedNetDensityToAtmTopSRV, // Texture2D<float2> g_tex2DUnoccludedNetDensityToAtmTop : register( t6 );
-        m_ptex2DEpipolarExtinctionSRV           // Texture2D<float3> g_tex2DEpipolarExtinction     : register( t7 );
+        m_ptex2DEpipolarExtinctionSRV,          // Texture2D<float3> g_tex2DEpipolarExtinction     : register( t6 );
+        nullptr,                                // t7
+        nullptr,                                // t8
+        nullptr,                                // t9
+        m_ptex2DAverageLuminanceSRV             // Texture2D<float>  g_tex2DAverageLuminance       : register( t10 );
     };
     FrameAttribs.pd3dDeviceContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
 
     // Unwarp inscattering image and apply it to attenuated backgorund
-    RenderQuad( FrameAttribs.pd3dDeviceContext, m_UnwarpEpipolarSctrImgTech );
+    RenderQuad( FrameAttribs.pd3dDeviceContext, Tech );
+}
+
+void CLightSctrPostProcess :: UpdateAverageLuminance(SFrameAttribs &FrameAttribs)
+{
+    if( !m_UpdateAverageLuminanceTech.IsValid() )
+    {
+        CD3DShaderMacroHelper Macros;
+        DefineMacros(Macros);
+        Macros.AddShaderMacro( "LIGHT_ADAPTATION", m_PostProcessingAttribs.m_bLightAdaptation );
+        Macros.AddShaderMacro("LOW_RES_LUMINANCE_MIPS", sm_iLowResLuminanceMips);
+        Macros.Finalize();
+        
+        m_UpdateAverageLuminanceTech.SetDeviceAndContext(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
+        m_UpdateAverageLuminanceTech.CreatePixelShaderFromFile( m_strEffectPath, "UpdateAverageLuminancePS", Macros );
+        m_UpdateAverageLuminanceTech.SetVS( m_pGenerateScreenSizeQuadVS );
+        m_UpdateAverageLuminanceTech.SetDS( m_pDisableDepthTestDS );
+        m_UpdateAverageLuminanceTech.SetRS( m_pSolidFillNoCullRS );
+        m_UpdateAverageLuminanceTech.SetBS( m_pAlphaBlendBS );
+    }
+
+    ID3D11RenderTargetView *pRTVs[] = {m_ptex2DAverageLuminanceRTV};
+    FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(_countof(pRTVs), pRTVs, nullptr);
+
+    ID3D11ShaderResourceView *pSRVs[] = {m_ptex2DLowResLuminanceSRV};
+    FrameAttribs.pd3dDeviceContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
+
+    SMiscDynamicParams MiscDynamicParams = {NULL};
+    MiscDynamicParams.fElapsedTime = (float)FrameAttribs.dElapsedTime;
+    UpdateConstantBuffer(FrameAttribs.pd3dDeviceContext, m_pcbMiscParams, &MiscDynamicParams, sizeof(MiscDynamicParams));
+    //cbuffer cbMiscDynamicParams : register( b4 )
+    FrameAttribs.pd3dDeviceContext->PSSetConstantBuffers(4, 1, &m_pcbMiscParams.p);
+
+    // Update average luminance
+    RenderQuad( FrameAttribs.pd3dDeviceContext, m_UpdateAverageLuminanceTech, 1, 1 );
 }
 
 void CLightSctrPostProcess :: FixInscatteringAtDepthBreaks(SFrameAttribs &FrameAttribs, 
                                                            UINT uiMaxStepsAlongRay, 
-                                                           const SShadowMapAttribs &SMAttribs)
+                                                           const SShadowMapAttribs &SMAttribs,
+                                                           bool bRenderLuminance)
 {
     bool bApplBG = true;
-    auto &FixInsctrAtDepthBreaksTech = m_FixInsctrAtDepthBreaksTech[bApplBG ? 1 : 0];
+    auto &FixInsctrAtDepthBreaksTech = m_FixInsctrAtDepthBreaksTech[(bApplBG ? 1 : 0) + (bRenderLuminance ? 2 : 0)];
     if( !FixInsctrAtDepthBreaksTech.IsValid() )
     {
         CD3DShaderMacroHelper Macros;
         DefineMacros(Macros);
         Macros.AddShaderMacro("CASCADE_PROCESSING_MODE", CASCADE_PROCESSING_MODE_SINGLE_PASS);
+        Macros.AddShaderMacro("PERFORM_TONE_MAPPING", !bRenderLuminance);
+        Macros.AddShaderMacro("AUTO_EXPOSURE", m_PostProcessingAttribs.m_bAutoExposure);
+        Macros.AddShaderMacro("TONE_MAPPING_MODE", m_PostProcessingAttribs.m_uiToneMappingMode);
         Macros.Finalize();
         FixInsctrAtDepthBreaksTech.SetDeviceAndContext(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
         FixInsctrAtDepthBreaksTech.CreatePixelShaderFromFile( m_strEffectPath, bApplBG ? "FixAndApplyInscatteredRadiancePS" : "FixInscatteredRadiancePS", Macros );
         FixInsctrAtDepthBreaksTech.SetVS( m_pGenerateScreenSizeQuadVS );
-        FixInsctrAtDepthBreaksTech.SetDS( m_pNoDepth_StEqual_KeepStencilDS, 0 );
+        // If rendering luminance only, disable depth and stencil tests to render all pixels
+        FixInsctrAtDepthBreaksTech.SetDS( bRenderLuminance ? m_pDisableDepthTestDS : m_pNoDepth_StEqual_KeepStencilDS, 0 );
         FixInsctrAtDepthBreaksTech.SetRS( m_pSolidFillNoCullRS );
-        FixInsctrAtDepthBreaksTech.SetBS( m_pAdditiveBlendBS );
+        // If rendering luminance only, use default blend state to overwrite old luminance values
+        FixInsctrAtDepthBreaksTech.SetBS( bRenderLuminance ? m_pDefaultBS : m_pAdditiveBlendBS );
     }
 
     ID3D11ShaderResourceView *pSRVs[] = 
@@ -1060,8 +1497,11 @@ void CLightSctrPostProcess :: FixInscatteringAtDepthBreaks(SFrameAttribs &FrameA
         FrameAttribs.ptex2DShadowMapSRV,        // Texture2D<float>  g_tex2DLightSpaceDepthMap     : register( t3 );
         m_ptex2DMinMaxShadowMapSRV[0],          // Texture2D<float2> g_tex2DMinMaxLightSpaceDepth  : register( t4 );
         m_ptex2DOccludedNetDensityToAtmTopSRV,  // Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
-        m_ptex2DUnoccludedNetDensityToAtmTopSRV,// Texture2D<float2> g_tex2DUnoccludedNetDensityToAtmTop : register( t6 );
-        m_ptex2DSliceUVDirAndOriginSRV          // Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t7 );
+        m_ptex2DSliceUVDirAndOriginSRV,         // Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t6 );
+        m_ptex3DSingleScatteringSRV,            // Texture3D<float3> g_tex3DSingleSctrLUT          : register( t7 );
+        m_ptex3DHighOrderScatteringSRV,         // Texture3D<float3> g_tex3DHighOrderSctrLUT       : register( t8 );
+        m_ptex3DMultipleScatteringSRV,          // Texture3D<float3> g_tex3DMultipleSctrLUT        : register( t9  );
+        m_ptex2DAverageLuminanceSRV             // Texture2D<float>  g_tex2DAverageLuminance       : register( t10 );
     };
     FrameAttribs.pd3dDeviceContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);
     
@@ -1149,10 +1589,16 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
             m_DoRayMarchTech[i].Release();
         m_InterpolateIrradianceTech.Release();
         m_UnwarpEpipolarSctrImgTech.Release();
-        m_FixInsctrAtDepthBreaksTech[0].Release();
-        m_FixInsctrAtDepthBreaksTech[1].Release();
+        m_UnwarpAndRenderLuminanceTech.Release();
+        m_UpdateAverageLuminanceTech.Release();
+        for(size_t i=0; i<_countof(m_FixInsctrAtDepthBreaksTech); ++i)
+            m_FixInsctrAtDepthBreaksTech[i].Release();
         m_RenderSampleLocationsTech.Release();
         m_RenderSunTech.Release();
+        m_PrecomputeSingleSctrTech.Release();
+        m_ComputeSctrRadianceTech.Release();
+        m_ComputeScatteringOrderTech.Release();
+        m_AddScatteringOrderTech.Release();
     }
     bool bUseCombinedMinMaxTexture = PPAttribs.m_uiCascadeProcessingMode == CASCADE_PROCESSING_MODE_SINGLE_PASS ||
                                      PPAttribs.m_uiCascadeProcessingMode == CASCADE_PROCESSING_MODE_MULTI_PASS_INST ||
@@ -1183,7 +1629,9 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     if( PPAttribs.m_bUse1DMinMaxTree != m_PostProcessingAttribs.m_bUse1DMinMaxTree ||
         PPAttribs.m_uiCascadeProcessingMode != m_PostProcessingAttribs.m_uiCascadeProcessingMode ||
         bUseCombinedMinMaxTexture != m_bUseCombinedMinMaxTexture ||
-        PPAttribs.m_bEnableLightShafts != m_PostProcessingAttribs.m_bEnableLightShafts )
+        PPAttribs.m_bEnableLightShafts != m_PostProcessingAttribs.m_bEnableLightShafts ||
+        PPAttribs.m_uiMultipleScatteringMode != m_PostProcessingAttribs.m_uiMultipleScatteringMode ||
+        PPAttribs.m_uiSingleScatteringMode != m_PostProcessingAttribs.m_uiSingleScatteringMode)
     {
         for(int i=0; i<_countof(m_DoRayMarchTech); ++i)
             m_DoRayMarchTech[i].Release();
@@ -1193,14 +1641,31 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
         PPAttribs.m_uiMaxSamplesInSlice != m_PostProcessingAttribs.m_uiMaxSamplesInSlice )
     {
         m_UnwarpEpipolarSctrImgTech.Release();
+        m_UnwarpAndRenderLuminanceTech.Release();
+    }
+
+    if( PPAttribs.m_bAutoExposure != m_PostProcessingAttribs.m_bAutoExposure || 
+        PPAttribs.m_uiToneMappingMode != m_PostProcessingAttribs.m_uiToneMappingMode ||
+        PPAttribs.m_bCorrectScatteringAtDepthBreaks != m_PostProcessingAttribs.m_bCorrectScatteringAtDepthBreaks )
+    {
+        m_UnwarpEpipolarSctrImgTech.Release();
+    }
+
+    if( PPAttribs.m_bLightAdaptation != m_PostProcessingAttribs.m_bLightAdaptation )
+    {
+        m_UpdateAverageLuminanceTech.Release();
     }
 
     if( PPAttribs.m_uiCascadeProcessingMode != m_PostProcessingAttribs.m_uiCascadeProcessingMode ||
         bUseCombinedMinMaxTexture != m_bUseCombinedMinMaxTexture ||
-        PPAttribs.m_bEnableLightShafts != m_PostProcessingAttribs.m_bEnableLightShafts  )
+        PPAttribs.m_bEnableLightShafts != m_PostProcessingAttribs.m_bEnableLightShafts ||
+        PPAttribs.m_uiMultipleScatteringMode != m_PostProcessingAttribs.m_uiMultipleScatteringMode  ||
+        PPAttribs.m_uiSingleScatteringMode != m_PostProcessingAttribs.m_uiSingleScatteringMode ||
+        PPAttribs.m_bAutoExposure != m_PostProcessingAttribs.m_bAutoExposure || 
+        PPAttribs.m_uiToneMappingMode != m_PostProcessingAttribs.m_uiToneMappingMode)
     {
-        m_FixInsctrAtDepthBreaksTech[0].Release();
-        m_FixInsctrAtDepthBreaksTech[1].Release();
+        for(size_t i=0; i<_countof(m_FixInsctrAtDepthBreaksTech); ++i)
+            m_FixInsctrAtDepthBreaksTech[i].Release();
     }
     
     if( PPAttribs.m_uiMaxSamplesInSlice != m_PostProcessingAttribs.m_uiMaxSamplesInSlice || 
@@ -1241,8 +1706,13 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
         m_ptex2DEpipolarExtinctionRTV.Release();
         m_ptex2DEpipolarExtinctionSRV.Release();
         m_UnwarpEpipolarSctrImgTech.Release();
+        m_UnwarpAndRenderLuminanceTech.Release();
         m_RenderCoarseUnshadowedInsctrTech.Release();
     }
+
+    if( PPAttribs.m_uiSingleScatteringMode != m_PostProcessingAttribs.m_uiSingleScatteringMode ||
+        PPAttribs.m_uiMultipleScatteringMode != m_PostProcessingAttribs.m_uiMultipleScatteringMode )
+        m_RenderCoarseUnshadowedInsctrTech.Release();
 
     bool bRecomputeSctrCoeffs = m_PostProcessingAttribs.m_bUseCustomSctrCoeffs != PPAttribs.m_bUseCustomSctrCoeffs ||
                                 m_PostProcessingAttribs.m_fAerosolDensityScale != PPAttribs.m_fAerosolDensityScale ||
@@ -1258,8 +1728,9 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     {
         m_ptex2DOccludedNetDensityToAtmTopSRV.Release();
         m_ptex2DOccludedNetDensityToAtmTopRTV.Release();
-        m_ptex2DUnoccludedNetDensityToAtmTopSRV.Release();
-        m_ptex2DUnoccludedNetDensityToAtmTopRTV.Release();
+        m_ptex3DSingleScatteringSRV.Release();
+        m_ptex2DAmbientSkyLightRTV.Release();
+        m_ptex2DAmbientSkyLightSRV.Release();
         ComputeScatteringCoefficients(FrameAttribs.pd3dDeviceContext);
     }
 
@@ -1296,7 +1767,7 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     FrameAttribs.pd3dDeviceContext->CSSetConstantBuffers(0, _countof(pCBs), pCBs);
         
 
-    ID3D11SamplerState *pSamplers[] = { m_psamLinearClamp, m_psamLinearBorder0, m_psamComparison };
+    ID3D11SamplerState *pSamplers[] = { m_psamLinearClamp, m_psamLinearBorder0, m_psamComparison, m_psamPointClamp };
     FrameAttribs.pd3dDeviceContext->PSSetSamplers(0, _countof(pSamplers), pSamplers);
     FrameAttribs.pd3dDeviceContext->CSSetSamplers(0, 1, pSamplers);
 
@@ -1307,6 +1778,18 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     if( !m_ptex2DOccludedNetDensityToAtmTopSRV )
     {
         CreatePrecomputedOpticalDepthTexture(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
+    }
+    
+    if( (m_PostProcessingAttribs.m_uiMultipleScatteringMode > MULTIPLE_SCTR_MODE_NONE ||
+         PPAttribs.m_uiSingleScatteringMode == SINGLE_SCTR_MODE_LUT) &&
+        !m_ptex3DSingleScatteringSRV )
+    {
+        CreatePrecomputedScatteringLUT(FrameAttribs.pd3dDevice, FrameAttribs.pd3dDeviceContext);
+    }
+
+    if( m_PostProcessingAttribs.m_bAutoExposure && !m_ptex2DLowResLuminanceRTV )
+    {
+        CreateLowResLuminanceTexture(FrameAttribs.pd3dDevice);
     }
 
     float Zero[4]={0,0,0,0};
@@ -1364,15 +1847,24 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
         ID3D11DepthStencilView *pDSV = m_ptex2DScreenSizeDSV;
         ID3D11RenderTargetView *pRTV[] = { FrameAttribs.pDstRTV };
         FrameAttribs.pd3dDeviceContext->ClearDepthStencilView(pDSV, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0, 0);
+        
+        if( m_PostProcessingAttribs.m_bAutoExposure )
+        {
+            // Render scene luminance to low-resolution texture
+            FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(1, &m_ptex2DLowResLuminanceRTV.p, nullptr);
+            UnwarpEpipolarScattering(FrameAttribs, true);
+            FrameAttribs.pd3dDeviceContext->GenerateMips(m_ptex2DLowResLuminanceSRV);
 
+            UpdateAverageLuminance(FrameAttribs);
+        }
         // Transform inscattering irradiance from epipolar coordinates back to rectangular
         FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(1, pRTV, pDSV);
-        UnwarpEpipolarScattering(FrameAttribs);
+        UnwarpEpipolarScattering(FrameAttribs, false);
     
         // Correct inscattering for pixels, for which no suitable interpolation sources were found
         if( m_PostProcessingAttribs.m_bCorrectScatteringAtDepthBreaks )
         {
-            FixInscatteringAtDepthBreaks(FrameAttribs, uiMaxStepsAlongRayAtDepthBreak0, SMAttribs);
+            FixInscatteringAtDepthBreaks(FrameAttribs, uiMaxStepsAlongRayAtDepthBreak0, SMAttribs, false);
         }
 
         if( m_PostProcessingAttribs.m_bShowSampling )
@@ -1382,9 +1874,19 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     }
     else if(m_PostProcessingAttribs.m_uiLightSctrTechnique == LIGHT_SCTR_TECHNIQUE_BRUTE_FORCE )
     {
+        if( m_PostProcessingAttribs.m_bAutoExposure )
+        {
+            // Render scene luminance to low-resolution texture
+            FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(1, &m_ptex2DLowResLuminanceRTV.p, nullptr);
+            FixInscatteringAtDepthBreaks(FrameAttribs, m_PostProcessingAttribs.m_uiShadowMapResolution, SMAttribs, true);
+            FrameAttribs.pd3dDeviceContext->GenerateMips(m_ptex2DLowResLuminanceSRV);
+
+            UpdateAverageLuminance(FrameAttribs);
+        }
+
         FrameAttribs.pd3dDeviceContext->ClearDepthStencilView(m_ptex2DScreenSizeDSV, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0, 0);
         FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(1, &FrameAttribs.pDstRTV, m_ptex2DScreenSizeDSV);
-        FixInscatteringAtDepthBreaks(FrameAttribs, m_PostProcessingAttribs.m_uiShadowMapResolution, SMAttribs);
+        FixInscatteringAtDepthBreaks(FrameAttribs, m_PostProcessingAttribs.m_uiShadowMapResolution, SMAttribs, false);
     }
 }
 
@@ -1598,7 +2100,7 @@ void CLightSctrPostProcess :: ComputeSunColor( const D3DXVECTOR3 &vDirectionOnSu
     float zenithFactor = min( max(vDirectionOnSun.y, 0.0f), 1.0f);
     f4AmbientLight.x = zenithFactor*0.15f;
     f4AmbientLight.y = zenithFactor*0.1f;
-    f4AmbientLight.z = max(0.05f, zenithFactor*0.25f);
+    f4AmbientLight.z = max(0.005f, zenithFactor*0.25f);
     f4AmbientLight.w = 0.0f;
 
     D3DXVECTOR2 f2NetParticleDensityToAtmTop = GetDensityIntegralFromChapmanFunc(0, D3DXVECTOR3(0,1,0), vDirectionOnSun, m_MediaParams);
@@ -1771,4 +2273,85 @@ void CLightSctrPostProcess :: RenderSun(SFrameAttribs &FrameAttribs)
     RenderQuad( FrameAttribs.pd3dDeviceContext, m_RenderSunTech);
     
     FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(0, NULL, NULL);
+}
+
+void CLightSctrPostProcess :: CreateAmbientSkyLightTexture(ID3D11Device *pDevice, ID3D11DeviceContext *pContext)
+{
+    CRenderTechnique PrecomputeAmbientSkyLightTech;
+    PrecomputeAmbientSkyLightTech.SetDeviceAndContext(pDevice, pContext);
+    CD3DShaderMacroHelper Macros;
+    Macros.AddShaderMacro( "NUM_RANDOM_SPHERE_SAMPLES", sm_iNumRandomSamplesOnSphere );
+    Macros.Finalize();
+    PrecomputeAmbientSkyLightTech.CreatePixelShaderFromFile( m_strEffectPath, "PrecomputeAmbientSkyLightPS", Macros );
+    PrecomputeAmbientSkyLightTech.SetVS( m_pGenerateScreenSizeQuadVS );
+    PrecomputeAmbientSkyLightTech.SetDS( m_pDisableDepthTestDS, 0 );
+    PrecomputeAmbientSkyLightTech.SetRS( m_pSolidFillNoCullRS );
+    PrecomputeAmbientSkyLightTech.SetBS( m_pDefaultBS );
+
+    D3D11_TEXTURE2D_DESC AmbientSkyLightTexDesc = 
+    {
+        sm_iAmbientSkyLightTexDim,          //UINT Width;
+        1,                                  //UINT Height;
+        1,                                  //UINT MipLevels;
+        1,                                  //UINT ArraySize;
+        DXGI_FORMAT_R16G16B16A16_FLOAT,     //DXGI_FORMAT Format;
+        {1,0},                              //DXGI_SAMPLE_DESC SampleDesc;
+        D3D11_USAGE_DEFAULT,                //D3D11_USAGE Usage;
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,           //UINT BindFlags;
+        0,                                  //UINT CPUAccessFlags;
+        0,                                  //UINT MiscFlags;
+    };
+
+    m_ptex2DAmbientSkyLightSRV.Release();
+    m_ptex2DAmbientSkyLightRTV.Release();
+    CComPtr<ID3D11Texture2D> ptex2DAmbientSkyLight;
+    // Create 2-D texture, shader resource and target view buffers on the device
+    HRESULT hr;
+    V( pDevice->CreateTexture2D( &AmbientSkyLightTexDesc, NULL, &ptex2DAmbientSkyLight) );
+    V( pDevice->CreateShaderResourceView( ptex2DAmbientSkyLight, NULL, &m_ptex2DAmbientSkyLightSRV)  );
+    V( pDevice->CreateRenderTargetView( ptex2DAmbientSkyLight, NULL, &m_ptex2DAmbientSkyLightRTV)  );
+    
+    CComPtr<ID3D11RenderTargetView> pOrigRTV;
+    CComPtr<ID3D11DepthStencilView> pOrigDSV;
+    pContext->OMGetRenderTargets(1, &pOrigRTV, &pOrigDSV);
+
+    D3D11_VIEWPORT OrigViewPort;
+    UINT iNumOldViewports = 1;
+    pContext->RSGetViewports(&iNumOldViewports, &OrigViewPort);
+
+    ID3D11Buffer *pCBs[] = {m_pcbPostProcessingAttribs, m_pcbMediaAttribs};
+    pContext->VSSetConstantBuffers(0, _countof(pCBs), pCBs);
+    pContext->PSSetConstantBuffers(0, _countof(pCBs), pCBs);
+
+    ID3D11SamplerState *pSamplers[] = { m_psamLinearClamp, m_psamLinearBorder0, m_psamComparison, m_psamPointClamp };
+    pContext->PSSetSamplers(0, _countof(pSamplers), pSamplers);
+
+    if( !m_ptex2DOccludedNetDensityToAtmTopSRV )
+    {
+        CreatePrecomputedOpticalDepthTexture(pDevice, pContext);
+    }
+    
+    if( !m_ptex3DSingleScatteringSRV )
+    {
+        CreatePrecomputedScatteringLUT(pDevice, pContext);
+    }
+
+    ID3D11ShaderResourceView *pSRVs[2] = {m_ptex3DMultipleScatteringSRV, m_ptex2DSphereRandomSamplingSRV};
+    pContext->PSSetShaderResources(0, _countof(pSRVs), pSRVs);            
+
+    pContext->OMSetRenderTargets(1, &m_ptex2DAmbientSkyLightRTV.p, nullptr);
+    RenderQuad( pContext, PrecomputeAmbientSkyLightTech, sm_iAmbientSkyLightTexDim, 1);
+
+    pContext->RSSetViewports(iNumOldViewports, &OrigViewPort);
+    pContext->OMSetRenderTargets(1, &pOrigRTV.p, pOrigDSV);
+}
+
+ID3D11ShaderResourceView* CLightSctrPostProcess :: GetAmbientSkyLightSRV(ID3D11Device *pDevice, ID3D11DeviceContext *pContext)
+{
+    if( !m_ptex2DAmbientSkyLightSRV )
+    {
+        CreateAmbientSkyLightTexture(pDevice, pContext);
+    }
+
+    return m_ptex2DAmbientSkyLightSRV;
 }

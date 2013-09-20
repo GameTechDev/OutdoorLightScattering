@@ -47,6 +47,7 @@
 #ifndef EXTINCTION_EVAL_MODE
 #   define EXTINCTION_EVAL_MODE EXTINCTION_EVAL_MODE_EPIPOLAR
 #endif
+
 cbuffer cbPostProcessingAttribs : register( b0 )
 {
     SPostProcessingAttribs g_PPAttribs;
@@ -87,14 +88,22 @@ Texture2D<float2> g_tex2DCoordinates            : register( t1 );
 Texture2D<float>  g_tex2DEpipolarCamSpaceZ      : register( t2 );
 Texture2D<uint2>  g_tex2DInterpolationSource    : register( t6 );
 Texture2DArray<float> g_tex2DLightSpaceDepthMap : register( t3 );
-Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t7 );
+Texture2D<float4> g_tex2DSliceUVDirAndOrigin    : register( t6 );
 Texture2D<MIN_MAX_DATA_FORMAT> g_tex2DMinMaxLightSpaceDepth  : register( t4 );
 Texture2D<float3> g_tex2DInitialInsctrIrradiance: register( t5 );
 Texture2D<float4> g_tex2DColorBuffer            : register( t1 );
 Texture2D<float3> g_tex2DScatteredColor         : register( t3 );
 Texture2D<float2> g_tex2DOccludedNetDensityToAtmTop : register( t5 );
-Texture2D<float2> g_tex2DUnoccludedNetDensityToAtmTop : register( t6 );
-Texture2D<float3> g_tex2DEpipolarExtinction     : register( t7 );
+Texture2D<float3> g_tex2DEpipolarExtinction     : register( t6 );
+Texture3D<float3> g_tex3DSingleSctrLUT          : register( t7 );
+Texture3D<float3> g_tex3DHighOrderSctrLUT       : register( t8 );
+Texture3D<float3> g_tex3DMultipleSctrLUT        : register( t9 );
+Texture2D<float3> g_tex2DSphereRandomSampling   : register( t1 );
+Texture3D<float3> g_tex3DPreviousSctrOrder      : register( t0 );
+Texture3D<float3> g_tex3DPointwiseSctrRadiance  : register( t0 );
+Texture2D<float>  g_tex2DAverageLuminance       : register( t10 );
+Texture2D<float>  g_tex2DLowResLuminance        : register( t0 );
+
 
 float3 ProjSpaceXYZToWorldSpace(in float3 f3PosPS)
 {

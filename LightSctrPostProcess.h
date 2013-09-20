@@ -27,6 +27,8 @@ struct SFrameAttribs
     ID3D11Device *pd3dDevice;
     ID3D11DeviceContext *pd3dDeviceContext;
     
+    double dElapsedTime;
+
     SLightAttribs *pLightAttribs;
     ID3D11Buffer *pcbLightAttribs;
 
@@ -68,6 +70,9 @@ public:
                          D3DXVECTOR4 &f4AmbientLight);
     
     void RenderSun(SFrameAttribs &FrameAttribs);
+    ID3D11Buffer *GetMediaAttribsCB(){return m_pcbMediaAttribs;}
+    ID3D11ShaderResourceView* GetPrecomputedNetDensitySRV(){return m_ptex2DOccludedNetDensityToAtmTopSRV;}
+    ID3D11ShaderResourceView* GetAmbientSkyLightSRV(ID3D11Device *pDevice, ID3D11DeviceContext *pContext);
 
 private:
     void ReconstructCameraSpaceZ(SFrameAttribs &FrameAttribs);
@@ -80,10 +85,15 @@ private:
     void Build1DMinMaxMipMap(SFrameAttribs &FrameAttribs, int iCascadeIndex);
     void DoRayMarching(SFrameAttribs &FrameAttribs, UINT uiMaxStepsAlongRay, const SShadowMapAttribs &SMAttribs, int iCascadeIndex);
     void InterpolateInsctrIrradiance(SFrameAttribs &FrameAttribs);
-    void UnwarpEpipolarScattering(SFrameAttribs &FrameAttribs);
-    void FixInscatteringAtDepthBreaks(SFrameAttribs &FrameAttribs, UINT uiMaxStepsAlongRay, const SShadowMapAttribs &SMAttribs);
+    void UnwarpEpipolarScattering(SFrameAttribs &FrameAttribs, bool bRenderLuminance);
+    void UpdateAverageLuminance(SFrameAttribs &FrameAttribs);
+    void FixInscatteringAtDepthBreaks(SFrameAttribs &FrameAttribs, UINT uiMaxStepsAlongRay, const SShadowMapAttribs &SMAttribs, bool bRenderLuminance);
     void RenderSampleLocations(SFrameAttribs &FrameAttribs);
     HRESULT CreatePrecomputedOpticalDepthTexture(ID3D11Device *pDevice, ID3D11DeviceContext *pContext);
+    HRESULT CreatePrecomputedScatteringLUT(ID3D11Device *pDevice, ID3D11DeviceContext *pContext);
+    void CreateRandomSphereSamplingTexture(ID3D11Device *pDevice);
+    void CreateLowResLuminanceTexture(ID3D11Device *pDevice);
+    void CreateAmbientSkyLightTexture(ID3D11Device *pDevice, ID3D11DeviceContext *pContext);
 
     void DefineMacros(class CD3DShaderMacroHelper &Macros);
     
@@ -123,13 +133,34 @@ private:
     static const int sm_iNumPrecomputedHeights = 1024;
     static const int sm_iNumPrecomputedAngles = 1024;
     CComPtr<ID3D11ShaderResourceView> m_ptex2DOccludedNetDensityToAtmTopSRV;
-    CComPtr<ID3D11ShaderResourceView> m_ptex2DUnoccludedNetDensityToAtmTopSRV;
-    CComPtr<ID3D11RenderTargetView> m_ptex2DOccludedNetDensityToAtmTopRTV;
-    CComPtr<ID3D11RenderTargetView> m_ptex2DUnoccludedNetDensityToAtmTopRTV;
+    CComPtr<ID3D11RenderTargetView>   m_ptex2DOccludedNetDensityToAtmTopRTV;
+
+    
+    static const int sm_iPrecomputedSctrUDim = 32;
+    static const int sm_iPrecomputedSctrVDim = 128;
+    static const int sm_iPrecomputedSctrWDim = 64;
+    static const int sm_iPrecomputedSctrQDim = 16;
+    CComPtr<ID3D11ShaderResourceView> m_ptex3DSingleScatteringSRV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex3DHighOrderScatteringSRV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex3DMultipleScatteringSRV;
+    
+    static const int sm_iNumRandomSamplesOnSphere = 128;
+    CComPtr<ID3D11ShaderResourceView> m_ptex2DSphereRandomSamplingSRV;
 
     HRESULT CreateTextures(ID3D11Device* pd3dDevice);
     HRESULT CreateMinMaxShadowMap(ID3D11Device* pd3dDevice);
     CComPtr<ID3D11DepthStencilView> m_ptex2DScreenSizeDSV;
+
+    static const int sm_iLowResLuminanceMips = 7; // 64x64
+    CComPtr<ID3D11RenderTargetView> m_ptex2DLowResLuminanceRTV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex2DLowResLuminanceSRV;
+    
+    CComPtr<ID3D11RenderTargetView> m_ptex2DAverageLuminanceRTV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex2DAverageLuminanceSRV;
+
+    static const int sm_iAmbientSkyLightTexDim = 1024;
+    CComPtr<ID3D11RenderTargetView> m_ptex2DAmbientSkyLightRTV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex2DAmbientSkyLightSRV;
 
     UINT m_uiBackBufferWidth, m_uiBackBufferHeight;
 
@@ -149,13 +180,21 @@ private:
     CRenderTechnique m_DoRayMarchTech[2]; // 0 - min/max optimization disabled; 1 - min/max optimization enabled
     CRenderTechnique m_InterpolateIrradianceTech;
     CRenderTechnique m_UnwarpEpipolarSctrImgTech;
-    CRenderTechnique m_FixInsctrAtDepthBreaksTech[2]; // 0 - perform ray marching, 1 - perform ray marching and attenuate background
+    CRenderTechnique m_UnwarpAndRenderLuminanceTech;
+    CRenderTechnique m_UpdateAverageLuminanceTech;
+    CRenderTechnique m_FixInsctrAtDepthBreaksTech[4]; // bit 0: 0 - perform ray marching, 1 - perform ray marching and attenuate background
+                                                      // bit 1: 0 - perform tone mapping, 1 - render luminance only
     CRenderTechnique m_RenderSampleLocationsTech;
     CRenderTechnique m_RenderSunTech;
+    CRenderTechnique m_PrecomputeSingleSctrTech;
+    CRenderTechnique m_ComputeSctrRadianceTech;
+    CRenderTechnique m_ComputeScatteringOrderTech;
+    CRenderTechnique m_AddScatteringOrderTech;
 
     CComPtr<ID3D11SamplerState> m_psamLinearClamp;
     CComPtr<ID3D11SamplerState> m_psamLinearBorder0;
     CComPtr<ID3D11SamplerState> m_psamComparison;
+    CComPtr<ID3D11SamplerState> m_psamPointClamp;
 
     CComPtr<ID3D11DepthStencilState> m_pEnableDepthCmpEqDS;
     CComPtr<ID3D11DepthStencilState> m_pDisableDepthTestDS;
@@ -165,7 +204,7 @@ private:
 
     CComPtr<ID3D11RasterizerState> m_pSolidFillNoCullRS;
 
-    CComPtr<ID3D11BlendState> m_pDefaultBS, m_pAdditiveBlendBS;
+    CComPtr<ID3D11BlendState> m_pDefaultBS, m_pAdditiveBlendBS, m_pAlphaBlendBS;
 
     void ComputeScatteringCoefficients(ID3D11DeviceContext *pDeviceCtx = NULL);
     

@@ -95,7 +95,10 @@ public:
                 const D3DXVECTOR3 &vCameraPosition, 
                 const D3DXMATRIX &CameraViewProjMatrix,
                 ID3D11Buffer *pcbLightAttribs,
+                ID3D11Buffer *pcMediaScatteringParams,
                 ID3D11ShaderResourceView *pShadowMapSRV,
+                ID3D11ShaderResourceView *pPrecomputedNetDensitySRV,
+                ID3D11ShaderResourceView *pAmbientSkylightSRV,
                 bool bZOnlyPass);
     
     // Creates Direct3D11 device resources
@@ -135,7 +138,7 @@ private:
     CComPtr<ID3D11DepthStencilState> m_pDisableDepthTestDS;
 	CComPtr<ID3D11BlendState> m_pDefaultBS;
     CComPtr<ID3D11RasterizerState> m_pRSSolidFill, m_pRSSolidFillNoCull, m_pRSZOnlyPass, m_pRSWireframeFill;
-    CComPtr<ID3D11SamplerState> m_psamPointClamp, m_psamLinearMirror, m_psamLinearWrap, m_psamComaprison;
+    CComPtr<ID3D11SamplerState> m_psamPointClamp, m_psamLinearMirror, m_psamLinearWrap, m_psamComaprison, m_psamLinearClamp;
     CComPtr<ID3D11Buffer> m_pcbTerrainAttribs;
     CComPtr<ID3D11Buffer> m_pcbCameraAttribs;
 
