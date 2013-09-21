@@ -513,16 +513,38 @@ float4 GenerateSliceEndpointsPS(SScreenSizeQuadVSOutput In) : SV_Target
 
     // Check if there can definitely be no correct intersection with the boundary:
     //  
-    //  Light.x <= LeftBnd     Light.x >= RightBnd     Light.y >= TopBnd    Light.y <= BottomBnd
-    //                                                        *                     
-    //          ____                ____                   __/_                    ____
-    //        .|    |              |    |  .*             |    |                  |    |
-    //      .' |____|              |____|.'               |____|                  |____|
-    //     *                                                                         \    
-    //                                                                                *
+    //  Light.x <= LeftBnd    Light.y <= BottomBnd     Light.x >= RightBnd     Light.y >= TopBnd    
+    //                                                                                 *             
+    //          ____                 ____                    ____                   __/_             
+    //        .|    |               |    |                  |    |  .*             |    |            
+    //      .' |____|               |____|                  |____|.'               |____|            
+    //     *                           \                                                               
+    //                                  *                                                  
+    //     Left Boundary       Bottom Boundary           Right Boundary          Top Boundary 
+    //
     bool4 b4IsInvalidBoundary = bool4( (g_LightAttribs.f4LightScreenPos.xyxy - f4OutermostScreenPixelCoords.xyzw) * float4(1,1,-1,-1) <= 0 );
     if( dot(b4IsInvalidBoundary, b4BoundaryFlags) )
         return INVALID_EPIPOLAR_LINE;
+    // Additinal check above is required to eliminate false epipolar lines which can appear is shown below.
+    // The reason is that we have to use some safety delta when performing check in IsValidScreenLocation() 
+    // function. If we do not do this, we will miss valid entry points due to precision issues.
+    // As a result there could appear false entry points which fall into the safety region, but in fact lie
+    // outside the screen boundary:
+    //
+    //   LeftBnd-Delta LeftBnd           
+    //                      false epipolar line
+    //          |        |  /
+    //          |        | /          
+    //          |        |/         X - false entry point
+    //          |        *
+    //          |       /|
+    //          |------X-|-----------  BottomBnd
+    //          |     /  |
+    //          |    /   |
+    //          |___/____|___________ BottomBnd-Delta
+    //          
+    //          
+
 
     //             <------
     //   +1   0,1___________0.75

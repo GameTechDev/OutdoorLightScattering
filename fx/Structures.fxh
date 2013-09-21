@@ -207,7 +207,7 @@ struct SPostProcessingAttribs
 #ifdef __cplusplus
     SPostProcessingAttribs() : 
         m_uiNumEpipolarSlices(512),
-        m_uiMaxSamplesInSlice(512),
+        m_uiMaxSamplesInSlice(256),
         m_uiInitialSampleStepInSlice(16),
         // Note that sampling near the epipole is very cheap since only a few steps
         // required to perform ray marching
