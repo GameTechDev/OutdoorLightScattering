@@ -618,7 +618,9 @@ HRESULT COutdoorLightScatteringSample::CreateTmpBackBuffAndDepthBuff(ID3D11Devic
         cString( _L("OffscreenRenderTarget") ),
         SwapChainDesc.BufferDesc.Width,                                 //UINT Width
         SwapChainDesc.BufferDesc.Height,                                //UINT Height
-        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        // It is essential to use floating point format for back buffer
+        // to avoid banding artifacts at low light conditions
+        DXGI_FORMAT_R11G11B10_FLOAT);
 
     SAFE_DELETE(m_pOffscreenDepth);
     m_pOffscreenDepth = new CPUTRenderTargetDepth();
@@ -1701,7 +1703,7 @@ void COutdoorLightScatteringSample::Render(double deltaSeconds)
 
         FrameAttribs.pcbLightAttribs = m_pcbLightAttribs;
 
-        m_PPAttribs.m_uiMaxShadowMapStep = m_uiShadowMapResolution / 16;
+        m_PPAttribs.m_fMaxShadowMapStep = static_cast<float>(m_uiShadowMapResolution / 4);
 
         m_PPAttribs.m_f2ShadowMapTexelSize = D3DXVECTOR2( 1.f / static_cast<float>(m_uiShadowMapResolution), 1.f / static_cast<float>(m_uiShadowMapResolution) );
         m_PPAttribs.m_uiShadowMapResolution = m_uiShadowMapResolution;

@@ -18,6 +18,8 @@
 
 #define FLT_MAX 3.402823466e+38f
 
+#define RGB_TO_LUMINANCE float3(0.212671, 0.715160, 0.072169)
+
 // Using static definitions instead of constant buffer variables is 
 // more efficient because the compiler is able to optimize the code 
 // more aggressively
@@ -46,6 +48,10 @@
 
 #ifndef EXTINCTION_EVAL_MODE
 #   define EXTINCTION_EVAL_MODE EXTINCTION_EVAL_MODE_EPIPOLAR
+#endif
+
+#ifndef AUTO_EXPOSURE
+#   define AUTO_EXPOSURE 1
 #endif
 
 cbuffer cbPostProcessingAttribs : register( b0 )
@@ -157,4 +163,15 @@ void GetRaySphereIntersection2(in float3 f3RayOrigin,
     D = sqrt( max(D,0) );
     f4Intersections =   f2RealRootMask.xxyy * float4(-B - D.x, -B + D.x, -B - D.y, -B + D.y) / (2*A) + 
                       (1-f2RealRootMask.xxyy) * float4(-1,-1,-1,-1);
+}
+
+float GetAverageSceneLuminance()
+{
+#if AUTO_EXPOSURE
+    float fAveLogLum = g_tex2DAverageLuminance.Load( int3(0,0,0) );
+#else
+    float fAveLogLum =  0.1;
+#endif
+    fAveLogLum = max(0.05, fAveLogLum); // Average luminance is an approximation to the key of the scene
+    return fAveLogLum;
 }

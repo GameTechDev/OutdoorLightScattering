@@ -247,8 +247,8 @@ void CLightSctrPostProcess :: OnDestroyDevice()
 {
     m_ptex2DSliceEndpointsSRV.Release();
     m_ptex2DSliceEndpointsRTV.Release();
-    m_ptex2DCoordianteTextureSRV.Release();
-    m_ptex2DCoordianteTextureRTV.Release();
+    m_ptex2DCoordinateTextureSRV.Release();
+    m_ptex2DCoordinateTextureRTV.Release();
     m_ptex2DEpipolarImageDSV.Release();
     m_ptex2DInterpolationSourcesSRV.Release();
     m_ptex2DInterpolationSourcesUAV.Release();
@@ -884,13 +884,13 @@ void CLightSctrPostProcess :: RenderCoordinateTexture(SFrameAttribs &FrameAttrib
     }
     // Coordinate texture is a texture with dimensions [Total Samples X Num Slices]
     // Texel t[i,j] contains projection-space screen cooridantes of the i-th sample in j-th epipolar slice
-    ID3D11RenderTargetView *ppRTVs[] = {m_ptex2DCoordianteTextureRTV, m_ptex2DEpipolarCamSpaceZRTV};
+    ID3D11RenderTargetView *ppRTVs[] = {m_ptex2DCoordinateTextureRTV, m_ptex2DEpipolarCamSpaceZRTV};
     FrameAttribs.pd3dDeviceContext->OMSetRenderTargets(_countof(ppRTVs), ppRTVs, m_ptex2DEpipolarImageDSV);
 
-    static const float fInvalidCoordinate = -1e+30f;
+    static const float fInvalidCoordinate = -1e+30f; // Both coord texture and epipolar CamSpaceZ are 32-bit float
     float InvalidCoords[] = {fInvalidCoordinate, fInvalidCoordinate, fInvalidCoordinate, fInvalidCoordinate};
     // Clear both render targets with values that can't be correct projection space coordinates and camera space Z:
-    FrameAttribs.pd3dDeviceContext->ClearRenderTargetView(m_ptex2DCoordianteTextureRTV, InvalidCoords);
+    FrameAttribs.pd3dDeviceContext->ClearRenderTargetView(m_ptex2DCoordinateTextureRTV, InvalidCoords);
     FrameAttribs.pd3dDeviceContext->ClearRenderTargetView(m_ptex2DEpipolarCamSpaceZRTV, InvalidCoords);
     // Clear depth stencil view. Since we use stencil part only, there is no need to clear depth
     // Set stencil value to 0
@@ -957,7 +957,7 @@ void CLightSctrPostProcess :: RenderCoarseUnshadowedInctr(SFrameAttribs &FrameAt
 
     ID3D11ShaderResourceView *pSRVs[] = 
     {
-        m_ptex2DCoordianteTextureSRV,  //Texture2D<float2> g_tex2DCoordinates       : register( t1 );
+        m_ptex2DCoordinateTextureSRV,  //Texture2D<float2> g_tex2DCoordinates       : register( t1 );
         m_ptex2DEpipolarCamSpaceZSRV,  //Texture2D<float> g_tex2DEpipolarCamSpaceZ  : register( t2 );
         nullptr,                       // t3
         nullptr,                       // t4
@@ -968,8 +968,9 @@ void CLightSctrPostProcess :: RenderCoarseUnshadowedInctr(SFrameAttribs &FrameAt
         m_ptex3DMultipleScatteringSRV        // Texture3D<float3> g_tex3DMultipleSctrLUT    : register( t9 );
     };
     FrameAttribs.pd3dDeviceContext->PSSetShaderResources(1, _countof(pSRVs), pSRVs);
-
-    const float InvalidInsctr[] = {-1e+10, -1e+10, -1e+10, -1e+10};
+    
+    float flt16max = 65504.f; // Epipolar Inscattering is 16-bit float
+    const float InvalidInsctr[] = {-flt16max, -flt16max, -flt16max, -flt16max};
     if( m_ptex2DEpipolarInscatteringRTV )
         FrameAttribs.pd3dDeviceContext->ClearRenderTargetView(m_ptex2DEpipolarInscatteringRTV, InvalidInsctr);
     const float One[] = {1, 1, 1, 1};
@@ -1000,6 +1001,7 @@ void CLightSctrPostProcess :: RefineSampleLocations(SFrameAttribs &FrameAttribs)
         Macros.AddShaderMacro("INITIAL_SAMPLE_STEP", m_PostProcessingAttribs.m_uiInitialSampleStepInSlice);
         Macros.AddShaderMacro("THREAD_GROUP_SIZE"  , m_uiSampleRefinementCSThreadGroupSize );
         Macros.AddShaderMacro("REFINEMENT_CRITERION", m_PostProcessingAttribs.m_uiRefinementCriterion );
+        Macros.AddShaderMacro("AUTO_EXPOSURE",        m_PostProcessingAttribs.m_bAutoExposure);
         Macros.Finalize();
 
         m_RefineSampleLocationsTech.CreateComputeShaderFromFile( L"fx\\RefineSampleLocations.fx", "RefineSampleLocationsCS", Macros );
@@ -1007,9 +1009,16 @@ void CLightSctrPostProcess :: RefineSampleLocations(SFrameAttribs &FrameAttribs)
 
     ID3D11ShaderResourceView *pSRVs[] = 
     {
-        m_ptex2DCoordianteTextureSRV,  //Texture2D<float2> g_tex2DCoordinates       : register( t1 );
+        m_ptex2DCoordinateTextureSRV,  //Texture2D<float2> g_tex2DCoordinates       : register( t1 );
         m_ptex2DEpipolarCamSpaceZSRV,  //Texture2D<float> g_tex2DEpipolarCamSpaceZ  : register( t2 );
-        m_ptex2DEpipolarInscatteringSRV      // Texture2D<float3> g_tex2DScatteredColor   : register( t3 );
+        m_ptex2DEpipolarInscatteringSRV,        // Texture2D<float3> g_tex2DScatteredColor   : register( t3 );
+        nullptr,                                // t4
+        nullptr,                                // t5
+        nullptr,                                // t6
+        nullptr,                                // t7
+        nullptr,                                // t8
+        nullptr,                                // t9
+        m_ptex2DAverageLuminanceSRV             // Texture2D<float>  g_tex2DAverageLuminance  : register( t10 );
     };
     FrameAttribs.pd3dDeviceContext->CSSetShaderResources(1, _countof(pSRVs), pSRVs);
     FrameAttribs.pd3dDeviceContext->CSSetUnorderedAccessViews(0, 1, &m_ptex2DInterpolationSourcesUAV.p, NULL);
@@ -1161,7 +1170,7 @@ void CLightSctrPostProcess :: Build1DMinMaxMipMap(SFrameAttribs &FrameAttribs,
     }
 #endif
     // Note that we start rendering min/max shadow map from step == 2
-    for(UINT iStep = 2; iStep <= m_PostProcessingAttribs.m_uiMaxShadowMapStep; iStep *=2, uiParity = (uiParity+1)%2 )
+    for(UINT iStep = 2; iStep <= (UINT)m_PostProcessingAttribs.m_fMaxShadowMapStep; iStep *=2, uiParity = (uiParity+1)%2 )
     {
         // Use two buffers which are in turn used as the source and destination
         FrameAttribs.pd3dDeviceContext->OMSetRenderTargets( 1, &m_ptex2DMinMaxShadowMapRTV[uiParity].p, NULL);
@@ -1263,7 +1272,7 @@ void CLightSctrPostProcess :: DoRayMarching(SFrameAttribs &FrameAttribs,
     ID3D11ShaderResourceView *pSRVs[] = 
     {
         m_ptex2DCameraSpaceZSRV,            // Texture2D<float>  g_tex2DCamSpaceZ              : register( t0 );
-        m_ptex2DCoordianteTextureSRV,       // Texture2D<float2> g_tex2DCoordinates            : register( t1 );
+        m_ptex2DCoordinateTextureSRV,       // Texture2D<float2> g_tex2DCoordinates            : register( t1 );
         m_ptex2DEpipolarCamSpaceZSRV,       //Texture2D<float> g_tex2DEpipolarCamSpaceZ        : register( t2 );
         FrameAttribs.ptex2DShadowMapSRV,    // Texture2D<float>  g_tex2DLightSpaceDepthMap     : register( t3 );
         m_ptex2DMinMaxShadowMapSRV[0],      // Texture2D<float2> g_tex2DMinMaxLightSpaceDepth  : register( t4 );
@@ -1546,7 +1555,7 @@ void CLightSctrPostProcess :: RenderSampleLocations(SFrameAttribs &FrameAttribs)
     ID3D11ShaderResourceView *pSRVs[] = 
     {
         NULL,
-        m_ptex2DCoordianteTextureSRV,               // Texture2D<float2> g_tex2DCoordinates            : register( t1 );
+        m_ptex2DCoordinateTextureSRV,               // Texture2D<float2> g_tex2DCoordinates            : register( t1 );
         NULL,                                       // t2
         NULL,                                       // t3
         NULL,                                       // t4
@@ -1615,7 +1624,8 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
 
     if( PPAttribs.m_uiMaxSamplesInSlice != m_PostProcessingAttribs.m_uiMaxSamplesInSlice ||
         PPAttribs.m_uiInitialSampleStepInSlice != m_PostProcessingAttribs.m_uiInitialSampleStepInSlice ||
-        PPAttribs.m_uiRefinementCriterion != m_PostProcessingAttribs.m_uiRefinementCriterion)
+        PPAttribs.m_uiRefinementCriterion != m_PostProcessingAttribs.m_uiRefinementCriterion ||
+        PPAttribs.m_bAutoExposure != m_PostProcessingAttribs.m_bAutoExposure )
         m_RefineSampleLocationsTech.Release();
 
     if( PPAttribs.m_bUse1DMinMaxTree != m_PostProcessingAttribs.m_bUse1DMinMaxTree ||
@@ -1671,8 +1681,8 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
     if( PPAttribs.m_uiMaxSamplesInSlice != m_PostProcessingAttribs.m_uiMaxSamplesInSlice || 
         PPAttribs.m_uiNumEpipolarSlices != m_PostProcessingAttribs.m_uiNumEpipolarSlices )
     {
-        m_ptex2DCoordianteTextureRTV.Release();
-        m_ptex2DCoordianteTextureSRV.Release();
+        m_ptex2DCoordinateTextureRTV.Release();
+        m_ptex2DCoordinateTextureSRV.Release();
     }
     
     if( PPAttribs.m_uiMinMaxShadowMapResolution != m_PostProcessingAttribs.m_uiMinMaxShadowMapResolution || 
@@ -1734,7 +1744,7 @@ void CLightSctrPostProcess :: PerformPostProcessing(SFrameAttribs &FrameAttribs,
         ComputeScatteringCoefficients(FrameAttribs.pd3dDeviceContext);
     }
 
-    if( !m_ptex2DCoordianteTextureRTV || !m_ptex2DCoordianteTextureSRV )
+    if( !m_ptex2DCoordinateTextureRTV || !m_ptex2DCoordinateTextureSRV )
     {
         V( CreateTextures(FrameAttribs.pd3dDevice) );
     }
@@ -1909,11 +1919,11 @@ HRESULT CLightSctrPostProcess :: CreateTextures(ID3D11Device* pd3dDevice)
     };
 
     {
-        CComPtr<ID3D11Texture2D> ptex2DCoordianteTexture;
+        CComPtr<ID3D11Texture2D> ptex2DCoordinateTexture;
         // Create 2-D texture, shader resource and target view buffers on the device
-        V_RETURN( pd3dDevice->CreateTexture2D( &CoordinateTexDesc, NULL, &ptex2DCoordianteTexture) );
-        V_RETURN( pd3dDevice->CreateShaderResourceView( ptex2DCoordianteTexture, NULL, &m_ptex2DCoordianteTextureSRV)  );
-        V_RETURN( pd3dDevice->CreateRenderTargetView( ptex2DCoordianteTexture, NULL, &m_ptex2DCoordianteTextureRTV)  );
+        V_RETURN( pd3dDevice->CreateTexture2D( &CoordinateTexDesc, NULL, &ptex2DCoordinateTexture) );
+        V_RETURN( pd3dDevice->CreateShaderResourceView( ptex2DCoordinateTexture, NULL, &m_ptex2DCoordinateTextureSRV)  );
+        V_RETURN( pd3dDevice->CreateRenderTargetView( ptex2DCoordinateTexture, NULL, &m_ptex2DCoordinateTextureRTV)  );
     }
     
     {

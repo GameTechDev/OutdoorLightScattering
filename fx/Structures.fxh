@@ -173,7 +173,7 @@ struct SPostProcessingAttribs
     uint m_uiMinMaxShadowMapResolution;
 
     BOOL m_bUse1DMinMaxTree;
-    uint m_uiMaxShadowMapStep;
+    float m_fMaxShadowMapStep;
     float m_fMiddleGray;
     uint m_uiLightSctrTechnique;
 
@@ -221,7 +221,7 @@ struct SPostProcessingAttribs
         m_bEnableLightShafts(TRUE),
         m_uiInstrIntegralSteps(30),
         m_bUse1DMinMaxTree(TRUE),
-        m_uiMaxShadowMapStep(16),
+        m_fMaxShadowMapStep(16.f),
         m_f2ShadowMapTexelSize(0,0),
         m_uiMinMaxShadowMapResolution(0),
         m_fMiddleGray(0.18f),
@@ -233,7 +233,7 @@ struct SPostProcessingAttribs
         m_uiCascadeProcessingMode(CASCADE_PROCESSING_MODE_SINGLE_PASS),
         m_uiRefinementCriterion(REFINEMENT_CRITERION_INSCTR_DIFF),
         m_bIs32BitMinMaxMipMap(FALSE),
-        m_uiMultipleScatteringMode(MULTIPLE_SCTR_MODE_OCCLUDED),
+        m_uiMultipleScatteringMode(MULTIPLE_SCTR_MODE_UNOCCLUDED),
         m_uiSingleScatteringMode(SINGLE_SCTR_MODE_LUT),
         m_bAutoExposure(TRUE),
         m_uiToneMappingMode(TONE_MAPPING_MODE_UNCHARTED2),

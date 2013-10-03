@@ -78,12 +78,6 @@
 #   define LOW_RES_LUMINANCE_MIPS 7
 #endif
 
-#define RGB_TO_LUMINANCE float3(0.212671, 0.715160, 0.072169)
-
-#ifndef AUTO_EXPOSURE
-#   define AUTO_EXPOSURE 1
-#endif
-
 #ifndef TONE_MAPPING_MODE
 #   define TONE_MAPPING_MODE TONE_MAPPING_MODE_REINHARD_MOD
 #endif
@@ -216,13 +210,8 @@ float3 Uncharted2Tonemap(float3 x)
 
 float3 ToneMap(in float3 f3Color)
 {
-#if AUTO_EXPOSURE
-    float fAveLogLum = g_tex2DAverageLuminance.Load( int3(0,0,0) );
-#else
-    float fAveLogLum =  0.1;
-#endif
-    fAveLogLum = max(0.05, fAveLogLum); // Average luminance is an approximation to the key of the scene
-
+    float fAveLogLum = GetAverageSceneLuminance();
+    
     //const float middleGray = 1.03 - 2 / (2 + log10(fAveLogLum+1));
     const float middleGray = g_PPAttribs.m_fMiddleGray;
     // Compute scale factor such that average luminance maps to middle gray
@@ -1264,8 +1253,9 @@ float3 LookUpPrecomputedScattering(float3 f3StartPoint,
     float3 f3UVW0; 
     f3UVW0.xy = f4UVWQ.xy;
     float fQ0Slice = floor(f4UVWQ.w * PRECOMPUTED_SCTR_LUT_DIM.w - 0.5);
-    float fQWeight = (f4UVWQ.w * PRECOMPUTED_SCTR_LUT_DIM.w - 0.5) - fQ0Slice;
     fQ0Slice = clamp(fQ0Slice, 0, PRECOMPUTED_SCTR_LUT_DIM.w-1);
+    float fQWeight = (f4UVWQ.w * PRECOMPUTED_SCTR_LUT_DIM.w - 0.5) - fQ0Slice;
+    fQWeight = max(fQWeight, 0);
     float2 f2SliceMinMaxZ = float2(fQ0Slice, fQ0Slice+1)/PRECOMPUTED_SCTR_LUT_DIM.w + float2(0.5,-0.5) / (PRECOMPUTED_SCTR_LUT_DIM.z*PRECOMPUTED_SCTR_LUT_DIM.w);
     f3UVW0.z =  (fQ0Slice + f4UVWQ.z) / PRECOMPUTED_SCTR_LUT_DIM.w;
     f3UVW0.z = clamp(f3UVW0.z, f2SliceMinMaxZ.x, f2SliceMinMaxZ.y);
@@ -1579,7 +1569,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
     float3 f3RayleighInscattering = 0;
     float3 f3MieInscattering = 0;
     float2 f2ParticleNetDensityFromCam = 0;
-    float3 f3RayEnd = 0, f3RayStart;
+    float3 f3RayEnd = 0, f3RayStart = 0;
     
     // Note that cosTheta = dot(DirOnCamera, LightDir) = dot(ViewDir, DirOnLight) because
     // DirOnCamera = -ViewDir and LightDir = -DirOnLight
@@ -1660,7 +1650,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         }
 
         // We trace the ray in the light projection space, not in the world space
-        // Compute shadow map UV coordiantes of the ray end point and its depth in the light space
+        // Compute shadow map UV coordinates of the ray end point and its depth in the light space
         matrix mWorldToShadowMapUVDepth = g_LightAttribs.ShadowAttribs.mWorldToShadowMapUVDepth[uiCascadeInd];
         float3 f3StartUVAndDepthInLightSpace = WorldSpaceToShadowMapUV(f3RayStart, mWorldToShadowMapUVDepth);
         //f3StartUVAndDepthInLightSpace.z -= SHADOW_MAP_DEPTH_BIAS;
@@ -1672,6 +1662,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         // If the ray is directed exactly at the light source, trace length will be zero
         // Clamp to a very small positive value to avoid division by zero
         float fTraceLenInShadowMapUVSpace = max( length( f3ShadowMapTraceDir.xy ), 1e-7 );
+        // Note that f3ShadowMapTraceDir.xy can be exactly zero
         f3ShadowMapTraceDir /= fTraceLenInShadowMapUVSpace;
     
         float fShadowMapUVStepLen = 0;
@@ -1702,21 +1693,19 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         else
         {
             //Calculate length of the trace step in light projection space
-            fShadowMapUVStepLen = g_PPAttribs.m_f2ShadowMapTexelSize.x / max( abs(f3ShadowMapTraceDir.x), abs(f3ShadowMapTraceDir.y) );
+            float fMaxTraceDirDim = max( abs(f3ShadowMapTraceDir.x), abs(f3ShadowMapTraceDir.y) );
+            fShadowMapUVStepLen = (fMaxTraceDirDim > 0) ? (g_PPAttribs.m_f2ShadowMapTexelSize.x / fMaxTraceDirDim) : 0;
             // Take into account maximum number of steps specified by the g_MiscParams.fMaxStepsAlongRay
-            //fShadowMapUVStepLen = min(fTraceLenInShadowMapUVSpace/10, fShadowMapUVStepLen);
             fShadowMapUVStepLen = max(fTraceLenInShadowMapUVSpace/g_MiscParams.fMaxStepsAlongRay, fShadowMapUVStepLen);
         }
     
         // Calcualte ray step length in world space
         float fRayStepLengthWS = fRayLength * (fShadowMapUVStepLen / fTraceLenInShadowMapUVSpace);
-        // Assure that step length is not 0 so that we will not fall into an infinite loop and
-        // will not crash the driver
-        //fRayStepLengthWS = max(fRayStepLengthWS, g_PPAttribs.m_fMaxTracingDistance * 1e-5);
+        // Note that fTraceLenInShadowMapUVSpace can be very small when looking directly at sun
+        // Since fShadowMapUVStepLen is at least one shadow map texel in size, 
+        // fShadowMapUVStepLen / fTraceLenInShadowMapUVSpace >> 1 in this case and as a result
+        // fRayStepLengthWS >> fRayLength
 
-        // Scale trace direction in light projection space to calculate the final step
-        float3 f3ShadowMapUVAndDepthStep = f3ShadowMapTraceDir * fShadowMapUVStepLen;
-    
         // March the ray
         float fDistanceMarchedInCascade = 0;
         float3 f3CurrShadowMapUVAndDepthInLightSpace = f3StartUVAndDepthInLightSpace.xyz;
@@ -1729,10 +1718,33 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         // Note that min/max shadow map does not contain finest resolution level
         // The first level it contains corresponds to step == 2
         int iLevelDataOffset = -int(g_PPAttribs.m_uiMinMaxShadowMapResolution);
-        float fStep = 1.f;
-        float fMinWorldSpaceStep = 10000.f;
-        float fMaxShadowMapStep = min(fMinWorldSpaceStep/fRayStepLengthWS, g_PPAttribs.m_uiMaxShadowMapStep);
+        float fStepScale = 1.f;
+        float fMaxStepScale = g_PPAttribs.m_fMaxShadowMapStep;
+#if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
+        // In order for the numerical integration to be accurate enough, it is necessary to make 
+        // at least 10 steps along the ray. To assure this, limit the maximum world step by 
+        // 1/10 of the ray length.
+        // To avoid aliasing artifacts due to unstable sampling along the view ray, do this for
+        // each cascade separately
+        float fMaxAllowedWorldStepLen = fRayLength/10;
+        fMaxStepScale = min(fMaxStepScale, fMaxAllowedWorldStepLen/fRayStepLengthWS);
+        
+        // Make sure that the world step length is not greater than the maximum allowable length
+        if( fRayStepLengthWS > fMaxAllowedWorldStepLen )
+        {
+            fRayStepLengthWS = fMaxAllowedWorldStepLen;
+            // Recalculate shadow map UV step len
+            fShadowMapUVStepLen = fTraceLenInShadowMapUVSpace * fRayStepLengthWS / fRayLength;
+            // Disable 1D min/max optimization. Note that fMaxStepScale < 1 anyway since 
+            // fRayStepLengthWS > fMaxAllowedWorldStepLen. Thus there is no real need to
+            // make the max shadow map step negative. We do this just for clarity
+            fMaxStepScale = -1;
+        }
+#endif
 
+        // Scale trace direction in light projection space to calculate the step in shadow map
+        float3 f3ShadowMapUVAndDepthStep = f3ShadowMapTraceDir * fShadowMapUVStepLen;
+        
         [loop]
         while( fDistanceMarchedInCascade < fRayLength )
         {
@@ -1742,13 +1754,13 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
 
             if( bUse1DMinMaxMipMap )
             {
-                // If the step is smaller than the maximum allowed and the sample
-                // is located at the appropriate position, advance to the next coarser level
-                if( fStep < fMaxShadowMapStep && ((uiCurrSamplePos & ((2<<uiCurrTreeLevel)-1)) == 0) )
+                // If the step scale can be doubled without exceeding the maximum allowed scale and 
+                // the sample is located at the appropriate position, advance to the next coarser level
+                if( 2*fStepScale < fMaxStepScale && ((uiCurrSamplePos & ((2<<uiCurrTreeLevel)-1)) == 0) )
                 {
                     iLevelDataOffset += g_PPAttribs.m_uiMinMaxShadowMapResolution >> uiCurrTreeLevel;
                     uiCurrTreeLevel++;
-                    fStep *= 2.f;
+                    fStepScale *= 2.f;
                 }
 
                 while(uiCurrTreeLevel > uiMinLevel)
@@ -1758,8 +1770,8 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                     // What we need here is actually depth which is divided by the camera view space z
                     // Thus depth can be correctly interpolated in screen space:
                     // http://www.comp.nus.edu.sg/~lowkl/publications/lowk_persp_interp_techrep.pdf
-                    // A subtle moment here is that we need to be sure that we can skip fStep samples 
-                    // starting from 0 up to fStep-1. We do not need to do any checks against the sample fStep away:
+                    // A subtle moment here is that we need to be sure that we can skip fStepScale samples 
+                    // starting from 0 up to fStepScale-1. We do not need to do any checks against the sample fStepScale away:
                     //
                     //     --------------->
                     //
@@ -1769,8 +1781,8 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                     //     0    1    2    3
                     //
                     //     |------------------>|
-                    //           fStep = 4
-                    float fNextLightSpaceDepth = f3CurrShadowMapUVAndDepthInLightSpace.z + f3ShadowMapUVAndDepthStep.z * (fStep-1);
+                    //        fStepScale = 4
+                    float fNextLightSpaceDepth = f3CurrShadowMapUVAndDepthInLightSpace.z + f3ShadowMapUVAndDepthStep.z * (fStepScale-1);
                     float2 f2StartEndDepthOnRaySection = float2(f3CurrShadowMapUVAndDepthInLightSpace.z, fNextLightSpaceDepth);
                     f2StartEndDepthOnRaySection = f2StartEndDepthOnRaySection;//max(f2StartEndDepthOnRaySection, 1e-7);
 
@@ -1787,7 +1799,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
                     // If the ray section is neither fully lit, nor shadowed, we have to go to the finer level
                     uiCurrTreeLevel--;
                     iLevelDataOffset -= (int)(g_PPAttribs.m_uiMinMaxShadowMapResolution >> uiCurrTreeLevel);
-                    fStep /= 2.f;
+                    fStepScale /= 2.f;
                 };
 
                 // If we are at the finest level, sample the shadow map with PCF
@@ -1803,7 +1815,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
             }
 
             float fRemainingDist = max(fRayLength - fDistanceMarchedInCascade, 0);
-            float fIntegrationStep = min(fRayStepLengthWS * fStep, fRemainingDist);
+            float fIntegrationStep = min(fRayStepLengthWS * fStepScale, fRemainingDist);
             float fIntegrationDist = fDistanceMarchedInCascade + fIntegrationStep/2;
 
 #if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
@@ -1847,9 +1859,9 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
             // Store the distance where the ray first enters the light
             fDistToFirstLitSection = (fDistToFirstLitSection < 0 && IsInLight > 0) ? fTotalMarchedLength : fDistToFirstLitSection;
 #endif
-            f3CurrShadowMapUVAndDepthInLightSpace += f3ShadowMapUVAndDepthStep * fStep;
+            f3CurrShadowMapUVAndDepthInLightSpace += f3ShadowMapUVAndDepthStep * fStepScale;
             uiCurrSamplePos += 1 << uiCurrTreeLevel; // int -> float conversions are slow
-            fDistanceMarchedInCascade += fRayStepLengthWS * fStep;
+            fDistanceMarchedInCascade += fRayStepLengthWS * fStepScale;
 
 #if MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED || SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT
             fTotalLitLength += fIntegrationStep * IsInLight;
@@ -1878,9 +1890,14 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
         f3RayEnd = f3CameraPos + fFullRayLength * f3ViewDir;
         fRemainingLength = length(f3RayEnd - f3RemainingRayStart);
 #if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_INTEGRATION
-        // Do not allow integration step become less than 20 km
-        float fMinStep = 20000.f;
-        float fMumSteps = max(10, ceil(fRemainingLength/fMinStep) );
+        // Do not allow integration step to become less than 50 km
+        // Maximum possible view ray length is 2023 km (from the top of the
+        // atmosphere touching the Earth and then again to the top of the 
+        // atmosphere).
+        // For such ray, 41 integration step will be performed
+        // Also assure that at least 20 steps are always performed
+        float fMinStep = 50000.f;
+        float fMumSteps = max(20, ceil(fRemainingLength/fMinStep) );
         ComputeInsctrIntegral(f3RemainingRayStart,
                               f3RayEnd,
                               f3EarthCentre,
@@ -1906,7 +1923,7 @@ float3 ComputeShadowedInscattering( in float2 f2RayMarchingSampleLocation,
 #if CASCADE_PROCESSING_MODE == CASCADE_PROCESSING_MODE_SINGLE_PASS
     // Note that the first cascade used for ray marching must contain camera within it
     // otherwise this expression might fail
-    f3RayStart = f3CameraPos + max(0, f2RayAtmTopIsecs.x) * f3ViewDir;
+    f3RayStart = f3RestrainedCameraPos;
 #endif
 
 #if SINGLE_SCATTERING_MODE == SINGLE_SCTR_MODE_LUT || MULTIPLE_SCATTERING_MODE == MULTIPLE_SCTR_MODE_OCCLUDED
@@ -2349,7 +2366,7 @@ float ZenithAngle2TexCoord(float fCosZenithAngle, float fHeight, in float fTexDi
         fTexCoord = pow(fTexCoord, power);
         // Now remap texture coordinate to the upper half of the texture.
         // To avoid filtering across discontinuity at 0.5, we must map
-        // the texture coordiante to [0.5 + 0.5/fTexDim, 1 - 0.5/fTexDim]
+        // the texture coordinate to [0.5 + 0.5/fTexDim, 1 - 0.5/fTexDim]
         //
         //      0.5   1.5               D/2+0.5        D-0.5  texture coordinate x dimension
         //       |     |                   |            |
@@ -2364,7 +2381,7 @@ float ZenithAngle2TexCoord(float fCosZenithAngle, float fHeight, in float fTexDi
         fTexCoord = pow(fTexCoord, power);
         // Now remap texture coordinate to the lower half of the texture.
         // To avoid filtering across discontinuity at 0.5, we must map
-        // the texture coordiante to [0.5, 0.5 - 0.5/fTexDim]
+        // the texture coordinate to [0.5, 0.5 - 0.5/fTexDim]
         //
         //      0.5   1.5        D/2-0.5             texture coordinate x dimension
         //       |     |            |       
@@ -2401,7 +2418,7 @@ float TexCoord2ZenithAngle(float fTexCoord, float fHeight, in float fTexDim, flo
     return fCosZenithAngle;
 }
 
-static const float SafetyHeightMargin = 10.f;
+static const float SafetyHeightMargin = 16.f;
 #define NON_LINEAR_PARAMETERIZATION 1
 static const float HeightPower = 0.5f;
 static const float ViewZenithPower = 0.2;
@@ -2446,7 +2463,21 @@ void InsctrLUTCoords2WorldParams(in float4 f4UVWQ,
     fCosSunZenithAngle  = clamp(fCosSunZenithAngle,  -1, +1);
     // Compute allowable range for the cosine of the sun view angle for the given
     // view zenith and sun zenith angles
-    float D = sqrt( (1.0 - fCosViewZenithAngle * fCosViewZenithAngle) * (1.0 - fCosSunZenithAngle  * fCosSunZenithAngle) );
+    float D = (1.0 - fCosViewZenithAngle * fCosViewZenithAngle) * (1.0 - fCosSunZenithAngle  * fCosSunZenithAngle);
+    
+    // !!!!  IMPORTANT NOTE regarding NVIDIA hardware !!!!
+
+    // There is a very weird issue on NVIDIA hardware with clamp(), saturate() and min()/max() 
+    // functions. No matter what function is used, fCosViewZenithAngle and fCosSunZenithAngle
+    // can slightly fall outside [-1,+1] range causing D to be negative
+    // Using saturate(D), max(D, 0) and even D>0?D:0 does not work!
+    // The only way to avoid taking the square root of negative value and obtaining NaN is 
+    // to use max() with small positive value:
+    D = sqrt( max(D, 1e-20) );
+    
+    // The issue was reproduceable on NV GTX 680, driver version 9.18.13.2723 (9/12/2013).
+    // The problem does not arise on Intel hardware
+
     float2 f2MinMaxCosSunViewAngle = fCosViewZenithAngle*fCosSunZenithAngle + float2(-D, +D);
     // Clamp to allowable range
     fCosSunViewAngle    = clamp(fCosSunViewAngle, f2MinMaxCosSunViewAngle.x, f2MinMaxCosSunViewAngle.y);
@@ -2464,7 +2495,7 @@ float4 WorldParams2InsctrLUTCoords(float fHeight,
     // avoid numeric issues at the Earth surface and the top of the atmosphere
     // (ray/Earth and ray/top of the atmosphere intersection tests are unstable when fHeight == 0 and
     // fHeight == AtmTopHeight respectively)
-    fHeight = clamp(fHeight, SafetyHeightMargin, g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin);
+    fHeight = clamp(fHeight, SafetyHeightMargin, g_MediaParams.fAtmTopHeight - SafetyHeightMargin);
     f4UVWQ.x = saturate( (fHeight - SafetyHeightMargin) / (g_MediaParams.fAtmTopHeight - 2*SafetyHeightMargin) );
 
 #if NON_LINEAR_PARAMETERIZATION
@@ -2499,10 +2530,17 @@ float3 ComputeViewDir(in float fCosViewZenithAngle)
 float3 ComputeLightDir(in float3 f3ViewDir, in float fCosSunZenithAngle, in float fCosSunViewAngle)
 {
     float3 f3DirOnLight;
-    f3DirOnLight.x = f3ViewDir.x != 0 ? (fCosSunViewAngle - fCosSunZenithAngle * f3ViewDir.y) / f3ViewDir.x : 0;
+    f3DirOnLight.x = (f3ViewDir.x > 0) ? (fCosSunViewAngle - fCosSunZenithAngle * f3ViewDir.y) / f3ViewDir.x : 0;
     f3DirOnLight.y = fCosSunZenithAngle;
     f3DirOnLight.z = sqrt( saturate(1 - dot(f3DirOnLight.xy, f3DirOnLight.xy)) );
-    f3DirOnLight = normalize(f3DirOnLight);
+    // Do not normalize f3DirOnLight! Even if its length is not exactly 1 (which can 
+    // happen because of fp precision issues), all the dot products will still be as 
+    // specified, which is essentially important. If we normalize the vector, all the 
+    // dot products will deviate, resulting in wrong pre-computation.
+    // Since fCosSunViewAngle is clamped to allowable range, f3DirOnLight should always
+    // be normalized. However, due to some issues on NVidia hardware sometimes
+    // it may not be as that (see IMPORTANT NOTE regarding NVIDIA hardware)
+    //f3DirOnLight = normalize(f3DirOnLight);
     return f3DirOnLight;
 }
 

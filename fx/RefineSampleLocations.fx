@@ -39,7 +39,6 @@ RWTexture2D<uint2> g_rwtex2DInterpolationSource : register( u0 );
 // test if depth break is present in the section
 static const uint g_uiNumPackedFlags = THREAD_GROUP_SIZE/32;
 groupshared uint g_uiPackedCamSpaceDiffFlags[ g_uiNumPackedFlags ];
-
 #if REFINEMENT_CRITERION == REFINEMENT_CRITERION_INSCTR_DIFF
 groupshared float3 g_f3Inscattering[THREAD_GROUP_SIZE+1];
 #endif
@@ -64,7 +63,7 @@ void RefineSampleLocationsCS(uint3 Gid  : SV_GroupID,
     // Initialize flags with zeroes
     if( GTid.x < g_uiNumPackedFlags )
         g_uiPackedCamSpaceDiffFlags[GTid.x] = 0;
-
+    
     GroupMemoryBarrierWithGroupSync();
 
     // Let each thread in the group compute its own flag
@@ -88,7 +87,18 @@ void RefineSampleLocationsCS(uint3 Gid  : SV_GroupID,
         float3 f3Insctr0 = g_tex2DScatteredColor.Load( uint3(uiGlobalSampleInd,   uiSliceInd, 0) );
         float3 f3Insctr1 = g_tex2DScatteredColor.Load( uint3(uiGlobalSampleInd+1, uiSliceInd, 0) );
         float3 f3MaxInsctr = max(f3Insctr0, f3Insctr1);
-        f3MaxInsctr = max(f3MaxInsctr, 1e-2);
+        
+        // Compute minimum inscattering threshold based on the average scene luminance
+        float fAverageLum = GetAverageSceneLuminance();
+        // Inscattering threshold should be proportional to the average scene luminance and
+        // inversely proportional to the middle gray level (the higher middle gray, the briter the scene,
+        // thus the less the theshold)
+        // It should also account for the fact that rgb channels contribute differently
+        // to the percieved brightness. For r channel the threshold should be smallest, 
+        // for b channel - the largest
+        float3 f3MinInsctrThreshold = (0.02f * fAverageLum.xxx / RGB_TO_LUMINANCE.xyz) / g_PPAttribs.m_fMiddleGray;
+
+        f3MaxInsctr = max(f3MaxInsctr, f3MinInsctrThreshold);
         // Compare the difference with the threshold. If the neighbour sample is invalid, its inscattering
         // is large negative value and the difference is guaranteed to be larger than the threshold
         bool bFlag = all( (abs(f3Insctr0 - f3Insctr1)/f3MaxInsctr) < g_PPAttribs.m_fRefinementThreshold );

@@ -105,8 +105,8 @@ private:
     CComPtr<ID3D11ShaderResourceView> m_ptex2DSliceEndpointsSRV;
     CComPtr<ID3D11RenderTargetView> m_ptex2DSliceEndpointsRTV;
 
-    CComPtr<ID3D11ShaderResourceView> m_ptex2DCoordianteTextureSRV;
-    CComPtr<ID3D11RenderTargetView> m_ptex2DCoordianteTextureRTV;
+    CComPtr<ID3D11ShaderResourceView> m_ptex2DCoordinateTextureSRV;
+    CComPtr<ID3D11RenderTargetView> m_ptex2DCoordinateTextureRTV;
     CComPtr<ID3D11DepthStencilView> m_ptex2DEpipolarImageDSV;
 
     CComPtr<ID3D11ShaderResourceView> m_ptex2DEpipolarCamSpaceZSRV;
